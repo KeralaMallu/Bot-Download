@@ -71,7 +71,7 @@ class Config:
     MONGO_URI = os.environ.get("MONGO_URI", "")
     LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
 
-    KC_LINK_SECRET = os.environ.get("KC_LINK_SECRET", "KCS3cR3t_v4_d3f6a8b1e9c2a5d4e7f8b1a3c5e")
+    KC_LINK_SECRET = os.environ.get("KC_LINK_SECRET", "MyW3bs!t3S3cr3tK@y2025")
 
     TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", 1800))  # default 30m
     FILE_DELETE_HOURS = int(os.environ.get("FILE_DELETE_HOURS", 12))
