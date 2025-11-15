@@ -1,8 +1,11 @@
-# --- main.py (V4.3 - Correct DB Name Fix) ---
+# main.py (V4.5) - KeralaCaptain File Sender Bot (Fixed start link handling)
 """
-KeralaCaptain File Sender Bot - V4.3 (Robust Startup + DB Fix)
-- Fixes fallback database name to 'KeralaCaptainBotDB' as per user's config.
-- Integrates V4.1 features with a robust event loop and signal handling.
+Full, standalone bot script (V4.5).
+- Robust /start parsing (handles /start <token>, /start=<token>, etc.)
+- Atomic single-use token claim at send-time (prevents pre-mark race)
+- Always replies on errors (no silent failures)
+- Admin panel, broadcast, force-sub, stats, web server, DB fallback
+- All user-facing messages use HTML parse mode
 """
 
 import os
@@ -18,9 +21,7 @@ import signal
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
-# Import for Web Server
 from aiohttp import web
-
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
@@ -40,7 +41,11 @@ from pyrogram.types import (
     InlineKeyboardButton
 )
 
-# Load env
+# pymongo helpers for atomic updates
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
+
+# Load environment
 load_dotenv()
 
 # Logging
@@ -48,7 +53,9 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s] - 
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# Config (V4.1 Config)
+# -----------------------------
+# Configuration
+# -----------------------------
 class Config:
     API_ID = int(os.environ.get("API_ID", 0))
     API_HASH = os.environ.get("API_HASH", "")
@@ -56,6 +63,7 @@ class Config:
 
     raw_admins = os.environ.get("ADMIN_IDS", "").strip()
     if raw_admins:
+        # accept comma and/or space separated list
         ADMIN_IDS = [int(x.strip()) for x in re.split(r"[,\s]+", raw_admins) if x.strip()]
     else:
         ADMIN_IDS = []
@@ -63,9 +71,9 @@ class Config:
     MONGO_URI = os.environ.get("MONGO_URI", "")
     LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
 
-    KC_LINK_SECRET = os.environ.get("KC_LINK_SECRET", "MyW3bs!t3S3cr3tK@y2025")
+    KC_LINK_SECRET = os.environ.get("KC_LINK_SECRET", "KCS3cR3t_v4_d3f6a8b1e9c2a5d4e7f8b1a3c5e")
 
-    TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", 1800))
+    TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", 1800))  # default 30m
     FILE_DELETE_HOURS = int(os.environ.get("FILE_DELETE_HOURS", 12))
 
     WEBSITE_URL = os.environ.get("WEBSITE_URL", "https://www.keralacaptain.shop")
@@ -73,54 +81,49 @@ class Config:
 
     PORT = int(os.environ.get("PORT", 8080))
 
-
-# Validate
+# Validate essential config early
 if not (Config.API_ID and Config.API_HASH and Config.BOT_TOKEN and Config.MONGO_URI and Config.LOG_CHANNEL_ID and Config.ADMIN_IDS):
-    LOGGER.critical("FATAL: Missing required environment variables.")
+    LOGGER.critical("FATAL: Missing required environment variables. Please set API_ID, API_HASH, BOT_TOKEN, MONGO_URI, LOG_CHANNEL_ID, ADMIN_IDS")
+    if Config.KC_LINK_SECRET == "KCS3cR3t_v4_d3f6a8b1e9c2a5d4e7f8b1a3c5e":
+        LOGGER.warning("WARNING: Using default KC_LINK_SECRET. Change it in environment.")
     sys.exit(1)
 
-# MongoDB
+# -----------------------------
+# MongoDB connection and collections
+# -----------------------------
 try:
     db_client = AsyncIOMotorClient(Config.MONGO_URI)
     try:
         db = db_client.get_default_database()
         if db is None:
-             raise Exception("No default DB found in URI, using fallback.")
+            raise Exception("No default DB found in URI")
     except Exception:
         parsed = urlparse(Config.MONGO_URI)
         path = parsed.path or ""
         if path.startswith("/"):
             dbname = unquote(path[1:].split("/", 1)[0].split("?", 1)[0])
-            #
-            # --- ⚠️⚠️⚠️ ഇതാണ് പ്രധാന തിരുത്ത് (THE FIX) ⚠️⚠️⚠️ ---
-            #
-            # നിങ്ങളുടെ ശരിയായ ഡാറ്റാബേസ് പേര് 'KeralaCaptainBotDB' (Source 12)
-            # ഞാൻ ഇവിടെ fallback ആയി ചേർക്കുന്നു.
-            #
             db = db_client[dbname] if dbname else db_client['KeralaCaptainBotDB']
         else:
-            # ഇവിടെയും ശരിയായ പേര് ചേർക്കുന്നു
             db = db_client['KeralaCaptainBotDB']
-            
     LOGGER.info(f"Connected to MongoDB: {db.name}")
 except Exception as e:
     LOGGER.critical(f"Could not connect to MongoDB: {e}", exc_info=True)
     sys.exit(1)
 
-# Collections (ഇപ്പോൾ ഇവ 'KeralaCaptainBotDB'-ൽ നിന്നായിരിക്കും)
+# Collections
 media_collection = db['media']
 users_col = db['users']
 sent_files_log_col = db['sent_files_log']
 settings_col = db['bot_settings']
 conversations_col = db['conversations']
-tokens_col = db['issued_tokens']
+tokens_col = db['issued_tokens']  # used for single-use token enforcement
 
 # In-memory settings
 SETTINGS = {}
 
-# Bot client
+# Pyrogram bot client
 bot = Client(
-    name="KeralaCaptainSenderV4_3", # Version changed
+    name="KeralaCaptainSenderV4_5",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
@@ -128,68 +131,26 @@ bot = Client(
 
 start_time = time.time()
 
-# --------------------------------------------------------------------------------
-# --- WEB SERVER HANDLERS ---
-# --------------------------------------------------------------------------------
-
-routes = web.RouteTableDef()
-
-@routes.get('/')
-async def root_handler(request):
-    """Handles the root '/' request."""
-    uptime = timedelta(seconds=int(time.time() - start_time))
-    bot_username = "Unknown (starting...)"
-    if bot.is_connected:
-        try:
-            me = await bot.get_me()
-            bot_username = f"@{me.username}"
-        except Exception:
-            bot_username = "Error fetching username"
-            
-    return web.Response(
-        text=f"Bot is alive!\nBot Username: {bot_username}\nUptime: {uptime}",
-        content_type='text/plain'
-    )
-
-@routes.get('/health')
-async def health_check_handler(request):
-    """Handles the '/health' request for health checks."""
-    return web.Response(text="OK", content_type='text/plain')
-
-async def start_web_server():
-    """Initializes and starts the dummy web server."""
-    app = web.Application()
-    app.add_routes(routes)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
-    try:
-        await site.start()
-        LOGGER.info(f"Web server started successfully on port {Config.PORT}.")
-    except Exception as e:
-        LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
-        if bot.is_connected:
-            await bot.stop()
-        sys.exit(1)
-
-# --------------------------------------------------------------------------------
-# --- DATABASE & BOT LOGIC (V4.1 - മാറ്റമില്ലാതെ) ---
-# --------------------------------------------------------------------------------
-
-# ---------- DB indices creation ----------
+# -----------------------------
+# Database indices (create on startup)
+# -----------------------------
 async def create_db_indices():
     try:
+        # Index to let Mongo auto-delete expired send logs (if you want TTL)
+        # This uses expireAfterSeconds on a datetime field (works if 'delete_at' exists).
+        # Other logic also removes records after deletion.
         await sent_files_log_col.create_index("delete_at", expireAfterSeconds=0)
+        # Unique index for token hash
         await tokens_col.create_index("hash", unique=True)
         await users_col.create_index("last_count_reset")
         await media_collection.create_index("wp_post_id")
-        LOGGER.info("DB indices created/ensured.")
+        LOGGER.info("DB indices ensured.")
     except Exception as e:
         LOGGER.error(f"Error creating indices: {e}", exc_info=True)
 
-# ---------- settings load ----------
+# -----------------------------
+# Settings handling
+# -----------------------------
 async def load_settings_from_db():
     global SETTINGS
     try:
@@ -209,6 +170,7 @@ async def load_settings_from_db():
             }
             await settings_col.insert_one(default_settings)
             SETTINGS = default_settings
+        # override with environment-critical values
         SETTINGS["file_delete_hours"] = Config.FILE_DELETE_HOURS
         SETTINGS["token_expiry_seconds"] = Config.TOKEN_EXPIRY_SECONDS
         LOGGER.info("Settings loaded.")
@@ -231,7 +193,9 @@ async def update_db_setting(key: str, value):
     except Exception as e:
         LOGGER.error(f"Failed to update setting {key}: {e}", exc_info=True)
 
-# ---------- users helpers ----------
+# -----------------------------
+# User helpers
+# -----------------------------
 async def get_user_data(user_id: int):
     user_data = await users_col.find_one({"_id": user_id})
     if not user_data:
@@ -286,7 +250,7 @@ async def get_all_user_ids():
     cursor = users_col.find({"is_banned": False}, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
 
-# Admin conv state
+# Admin conversation helpers
 async def set_admin_conv(chat_id, stage):
     await conversations_col.update_one({"_id": chat_id}, {"$set": {"stage": stage}}, upsert=True)
 
@@ -296,10 +260,11 @@ async def get_admin_conv(chat_id):
 async def clear_admin_conv(chat_id):
     await conversations_col.delete_one({"_id": chat_id})
 
-# ---------- media helpers ----------
+# -----------------------------
+# Media helpers
+# -----------------------------
 async def get_media_by_post_id(post_id: int):
     try:
-        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷനിൽ നോക്കും
         return await media_collection.find_one({"wp_post_id": post_id})
     except Exception as e:
         LOGGER.error(f"Error fetching media by post_id {post_id}: {e}", exc_info=True)
@@ -307,7 +272,6 @@ async def get_media_by_post_id(post_id: int):
 
 async def update_media_links_in_db(post_id: int, new_message_ids, stream_link: str):
     try:
-        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷൻ അപ്ഡേറ്റ് ചെയ്യും
         await media_collection.update_one({"wp_post_id": post_id}, {"$set": {"message_ids": new_message_ids, "stream_link": stream_link}})
         LOGGER.info(f"Updated media links for post {post_id}")
     except Exception as e:
@@ -315,7 +279,6 @@ async def update_media_links_in_db(post_id: int, new_message_ids, stream_link: s
 
 async def get_post_id_from_msg_id(msg_id: int):
     try:
-        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷനിൽ നോക്കും
         doc = await media_collection.find_one({"message_ids": {"$elemMatch": {"id": msg_id}}})
         if doc:
             return doc.get('wp_post_id')
@@ -333,35 +296,15 @@ async def get_post_id_from_msg_id(msg_id: int):
         LOGGER.error(f"Error searching for post_id from msg_id {msg_id}: {e}", exc_info=True)
         return None
 
-# ---------- token utilities ----------
+# -----------------------------
+# Token utilities
+# -----------------------------
 def _base64url_decode(s: str) -> bytes:
     padding = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + padding)
 
 def token_hash_raw(token_raw: str) -> str:
     return hashlib.sha256(token_raw.encode()).hexdigest()
-
-async def is_token_used(token_raw: str) -> bool:
-    h = token_hash_raw(token_raw)
-    doc = await tokens_col.find_one({"hash": h})
-    if doc:
-        return bool(doc.get("used", False))
-    return False
-
-async def mark_token_used(token_raw: str, user_id: int = None):
-    h = token_hash_raw(token_raw)
-    now = datetime.now(timezone.utc)
-    doc = {
-        "hash": h,
-        "issued_raw": token_raw,
-        "used": True,
-        "used_by": user_id,
-        "used_at": now
-    }
-    try:
-        await tokens_col.update_one({"hash": h}, {"$set": doc}, upsert=True)
-    except Exception as e:
-        LOGGER.error(f"Failed to mark token used: {e}", exc_info=True)
 
 def compute_expected_hmac(payload: str) -> str:
     return hmac.new(Config.KC_LINK_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -373,55 +316,102 @@ def parse_token_raw(token_b64: str):
     except Exception as e:
         return None, str(e)
 
-async def verify_token(token_b64: str, expected_bot_username: str) -> int | None:
+async def verify_token_basic(token_b64: str, expected_bot_username: str):
+    """
+    Verify token signature, expiry, and bot target.
+    Returns tuple (msg_id:int, token_raw:str) if valid, else (None, None)
+    NOTE: This function DOES NOT mark token as used. Claiming is done at send-time atomically.
+    """
     if not token_b64:
-        return None
+        return None, None
     token_raw, err = parse_token_raw(token_b64)
     if not token_raw:
         LOGGER.warning(f"Token decode error: {err}")
-        return None
+        return None, None
     try:
+        # Split signature off
         if ":" not in token_raw:
-            LOGGER.warning("Token raw malformed.")
-            return None
+            LOGGER.warning("Token raw malformed (no ':').")
+            return None, None
         payload, sig_from_token = token_raw.rsplit(":", 1)
         expected_sig = compute_expected_hmac(payload)
         if not hmac.compare_digest(expected_sig, sig_from_token):
             LOGGER.warning("Invalid token signature.")
-            return None
+            return None, None
+        # payload expected: msg_id:expiry:bot:nonce
         parts = payload.split(":", 3)
         if len(parts) != 4:
             LOGGER.warning("Token payload parts != 4")
-            return None
+            return None, None
         msg_id_s, expiry_s, bot_username, nonce = parts
         if bot_username.lower() != expected_bot_username.lower():
-            LOGGER.warning("Token intended for a different bot.")
-            return None
+            LOGGER.warning(f"Token intended for different bot: {bot_username} != {expected_bot_username}")
+            return None, None
         expiry_ts = int(expiry_s)
         if time.time() > expiry_ts:
             LOGGER.warning(f"Expired token for msg {msg_id_s}.")
-            return None
-        single_use = SETTINGS.get("single_use_tokens", True)
-        if single_use:
-            used = await is_token_used(token_raw)
-            if used:
-                LOGGER.warning("Token already used.")
-                return None
-            await mark_token_used(token_raw, user_id=None)
-        else:
-            h = token_hash_raw(token_raw)
-            existing = await tokens_col.find_one({"hash": h})
-            if not existing:
-                try:
-                    await tokens_col.insert_one({"hash": h, "issued_raw": token_raw, "used": False, "issued_at": datetime.now(timezone.utc)})
-                except Exception:
-                    pass
-        return int(msg_id_s)
+            return None, None
+        return int(msg_id_s), token_raw
     except Exception as e:
         LOGGER.error(f"Token verification error: {e}", exc_info=True)
-        return None
+        return None, None
 
-# ---------- refresh file reference ----------
+# Atomic claim at send-time to enforce single-use tokens reliably
+async def claim_token_atomically(token_raw: str, user_id: int) -> bool:
+    """
+    Try to atomically claim token for single-use. Returns True if claim successful,
+    False if token already used by someone else.
+    Strategy:
+      - compute hash
+      - try to find_one_and_update doc with used: False -> set used True
+      - if no such doc, try to insert a new doc with used True (if insert fails due to duplicate, check existing doc's used)
+    """
+    h = token_hash_raw(token_raw)
+    now = datetime.now(timezone.utc)
+    try:
+        # Try to update existing unused doc atomically
+        filt = {"hash": h, "$or": [{"used": False}, {"used": {"$exists": False}}]}
+        update = {"$set": {"used": True, "used_by": user_id, "used_at": now}}
+        doc = await tokens_col.find_one_and_update(filt, update, return_document=ReturnDocument.AFTER)
+        if doc:
+            LOGGER.info("Token claimed via update for hash %s", h)
+            return True
+        # No existing doc or couldn't update; try to insert new doc (claim)
+        newdoc = {
+            "hash": h,
+            "issued_raw": token_raw,
+            "used": True,
+            "used_by": user_id,
+            "used_at": now,
+            "issued_at": now
+        }
+        try:
+            await tokens_col.insert_one(newdoc)
+            LOGGER.info("Token claimed via insert for hash %s", h)
+            return True
+        except DuplicateKeyError:
+            # Race: someone created a doc. Check if used
+            doc = await tokens_col.find_one({"hash": h})
+            if not doc:
+                LOGGER.error("Race: duplicate key but no doc found for hash %s", h)
+                return False
+            if doc.get("used"):
+                LOGGER.warning("Token already used (post-insert) for hash %s", h)
+                return False
+            # if doc exists and used is False, try to update it now
+            updated = await tokens_col.find_one_and_update({"hash": h, "used": False}, {"$set": {"used": True, "used_by": user_id, "used_at": now}}, return_document=ReturnDocument.AFTER)
+            if updated and updated.get("used"):
+                LOGGER.info("Token claimed after duplicate for hash %s", h)
+                return True
+            LOGGER.warning("Token could not be claimed after duplicate for hash %s", h)
+            return False
+    except Exception as e:
+        LOGGER.error(f"Error claiming token atomically: {e}", exc_info=True)
+        return False
+
+# -----------------------------
+# File refresh on FileReferenceExpired
+# -----------------------------
 async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
     LOGGER.warning(f"Attempting refresh for expired msg {expired_msg_id}")
     try:
@@ -473,53 +463,9 @@ async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
     except Exception as e:
         LOGGER.critical(f"Unhandled error during refresh: {e}", exc_info=True)
 
-# ---------- log sent file ----------
-async def log_sent_file_for_deletion(user_id: int, message_obj: Message, original_message_id: int):
-    try:
-        delete_at = datetime.now(timezone.utc) + timedelta(hours=SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS))
-        file_name = None
-        if getattr(message_obj, "document", None) and getattr(message_obj.document, "file_name", None):
-            file_name = message_obj.document.file_name
-        elif getattr(message_obj, "audio", None) and getattr(message_obj.audio, "title", None):
-            file_name = message_obj.audio.title
-        elif message_obj.caption:
-            file_name = message_obj.caption.strip().split("\n", 1)[0][:200]
-        if not file_name:
-            file_name = "your file"
-        await sent_files_log_col.insert_one({
-            "user_id": user_id,
-            "telegram_message_id": message_obj.id,
-            "log_channel_message_id": original_message_id,
-            "file_name": file_name,
-            "sent_at": datetime.now(timezone.utc),
-            "delete_at": delete_at
-        })
-    except Exception as e:
-        LOGGER.error(f"Failed to log sent file: {e}", exc_info=True)
-
-# ---------- force-sub helper ----------
-def get_force_sub_button(channel_ref):
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔔 Join Our Channel to Receive Downloads", url=channel_ref)]]
-    )
-
-async def check_force_sub(user_id: int):
-    fsub_channel = SETTINGS.get("force_sub_channel_id", 0)
-    if not SETTINGS.get("force_sub_enabled") or not fsub_channel:
-        return True
-    try:
-        await bot.get_chat_member(fsub_channel, user_id)
-        return True
-    except UserNotParticipant:
-        return False
-    except RPCError as e:
-        LOGGER.error(f"Error checking force sub: {e}", exc_info=True)
-        return False
-    except Exception as e:
-        LOGGER.error(f"Unexpected error in check_force_sub: {e}", exc_info=True)
-        return False
-
-# ---------- admin keyboards ----------
+# -----------------------------
+# Logging and helper UI
+# -----------------------------
 def get_main_admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
@@ -543,7 +489,9 @@ def get_settings_keyboard():
         [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin_main_menu")]
     ])
 
-# ---------- admin handlers ----------
+# -----------------------------
+# Admin handlers
+# -----------------------------
 @bot.on_message(filters.command(["admin", "settings"]) & filters.private & filters.user(Config.ADMIN_IDS))
 async def admin_panel_handler(client: Client, message: Message):
     await clear_admin_conv(message.from_user.id)
@@ -679,7 +627,6 @@ async def admin_conv_handler(client: Client, message: Message):
             if hours < 1:
                 raise ValueError("Must be >= 1")
             await update_db_setting("file_delete_hours", hours)
-            Config.FILE_DELETE_HOURS = hours
             await message.reply_text(f"✅ File delete time set to <b>{hours} hours</b>.", parse_mode=enums.ParseMode.HTML)
 
         elif stage == "admin_ban":
@@ -740,61 +687,124 @@ async def admin_conv_handler(client: Client, message: Message):
         if stage != "admin_broadcast":
             await admin_panel_handler(client, message)
 
-# ---------- user handlers ----------
+# -----------------------------
+# Force-sub helper
+# -----------------------------
+def get_force_sub_button(channel_ref):
+    # Improved, more professional text and emoji
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔔 Join our official channel to receive downloads", url=channel_ref)]]
+    )
+
+async def check_force_sub(user_id: int):
+    fsub_channel = SETTINGS.get("force_sub_channel_id", 0)
+    if not SETTINGS.get("force_sub_enabled") or not fsub_channel:
+        return True
+    try:
+        await bot.get_chat_member(fsub_channel, user_id)
+        return True
+    except UserNotParticipant:
+        return False
+    except RPCError as e:
+        LOGGER.error(f"Error checking force sub: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        LOGGER.error(f"Unexpected error in check_force_sub: {e}", exc_info=True)
+        return False
+
+# -----------------------------
+# /start handler (robust)
+# -----------------------------
+# We will parse the token in a tolerant way:
+# Accepts:
+#  - "/start TOKEN"
+#  - "/start=TOKEN"
+#  - "/start@BotName TOKEN"
+#  - "/start@BotName=TOKEN"
+_START_RE = re.compile(r'^/start(?:@[\w_]+)?(?:[ =])?(.+)?$', flags=re.IGNORECASE)
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command_handler(client: Client, message: Message):
     user_id = message.from_user.id
+
+    # Admin shortcut
     if user_id in Config.ADMIN_IDS:
         await admin_panel_handler(client, message)
         return
-    
+
+    # Basic user checks
     user_data = await get_user_data(user_id)
     if user_data.get("is_banned", False):
         await message.reply_text("<b>❌ You are banned from using this bot.</b>", parse_mode=enums.ParseMode.HTML)
         return
-    
-    if len(message.command) == 1:
+
+    # Always log incoming start message for debugging
+    LOGGER.info(f"[START] from={user_id} text={message.text!r} date={message.date}")
+
+    # Extract token in a tolerant way
+    token = None
+    text = (message.text or "").strip()
+    m = _START_RE.match(text)
+    if m:
+        token_group = m.group(1)
+        if token_group:
+            token = token_group.strip()
+    # fallback: if message.entities includes a bot command, get the substring after the command span
+    if not token:
+        try:
+            if message.entities:
+                for ent in message.entities:
+                    if ent.type == "bot_command":
+                        # entity offset + length
+                        start = ent.offset + ent.length
+                        rest = text[start:].strip()
+                        if rest:
+                            token = rest
+                            break
+        except Exception:
+            pass
+
+    # If no token, treat as plain /start
+    if not token:
         welcome_text = (
             "<b>👋 Welcome!</b>\n\n"
-            "To get downloads, please visit our website and click the download button. "
-            "Open the link in Telegram to receive the file here."
+            "To receive downloads, please visit our website and click the download button.\n"
+            f"Website: <b>{Config.WEBSITE_URL}</b>"
         )
         await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(Config.WEBSITE_BUTTON_TEXT, url=Config.WEBSITE_URL)]]), parse_mode=enums.ParseMode.HTML)
         return
-    
-    token = message.text.split(" ", 1)[1].strip()
+
+    # At this point we have a token string
     bot_info = await bot.get_me()
     bot_username = bot_info.username or ""
-    
-    msg_id_to_send = await verify_token(token, bot_username)
-    
+    # Verify token payload & signature (but DO NOT mark as used yet)
+    msg_id_to_send, token_raw = await verify_token_basic(token, bot_username)
     if not msg_id_to_send:
         await message.reply_text(
             "<b>⏳ Link expired or invalid.</b>\n\n"
-            "This download link has expired or cannot be used. Please go back to the website and get a new link.",
+            "This download link has expired or is invalid. Please go back to the website to get a new link.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(Config.WEBSITE_BUTTON_TEXT, url=Config.WEBSITE_URL)]]),
             parse_mode=enums.ParseMode.HTML
         )
         return
-        
-    LOGGER.info(f"User {user_id} requested message {msg_id_to_send} with valid token.")
-    
+
+    LOGGER.info(f"Token valid for message {msg_id_to_send}. Now enforcing force-sub/daily-limit and attempting send.")
+
+    # Force-sub check
     if SETTINGS.get("force_sub_enabled"):
         is_joined = await check_force_sub(user_id)
         if not is_joined:
             fsub_channel = SETTINGS.get("force_sub_channel_id")
-            channel_ref = fsub_channel
             invite_url = None
             try:
-                if isinstance(channel_ref, str) and channel_ref.startswith("@"):
-                    invite_url = f"https://t.me/{channel_ref.lstrip('@')}"
+                if isinstance(fsub_channel, str) and fsub_channel.startswith("@"):
+                    invite_url = f"https://t.me/{fsub_channel.lstrip('@')}"
                 else:
-                    channel_obj = await client.get_chat(channel_ref)
+                    channel_obj = await client.get_chat(fsub_channel)
                     if getattr(channel_obj, "invite_link", None):
                         invite_url = channel_obj.invite_link
-                    else:
-                        if getattr(channel_obj, "username", None):
-                            invite_url = f"https://t.me/{channel_obj.username}"
+                    elif getattr(channel_obj, "username", None):
+                        invite_url = f"https://t.me/{channel_obj.username}"
                 if not invite_url:
                     invite_url = Config.WEBSITE_URL
             except Exception as e:
@@ -806,14 +816,15 @@ async def start_command_handler(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
             return
-            
+
+    # Daily limit check
     daily_limit = SETTINGS.get("daily_limit", 5)
     if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
         await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
         return
-        
+
+    # Try to send file; claim token atomically AFTER successful send to avoid pre-mark race.
     status_msg = await message.reply_text("<b>✅ Link verified. Sending file, please wait...</b>", parse_mode=enums.ParseMode.HTML)
-    
     try:
         sent_file_msg = await client.copy_message(
             chat_id=user_id,
@@ -821,57 +832,71 @@ async def start_command_handler(client: Client, message: Message):
             message_id=msg_id_to_send,
             protect_content=SETTINGS.get("protect_content_enabled", True)
         )
-        
-        if sent_file_msg:
-            try:
-                token_raw, _ = parse_token_raw(token)
-                if token_raw:
-                    h = token_hash_raw(token_raw)
-                    await tokens_col.update_one({"hash": h}, {"$set": {"used": True, "used_by": user_id, "used_at": datetime.now(timezone.utc)}}, upsert=True)
-            except Exception as e:
-                LOGGER.warning(f"Could not update token used_by: {e}", exc_info=True)
-            
-            await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
-            await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
-            
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-                
-            delete_hours = SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS)
-            try:
-                await sent_file_msg.reply_text(
-                    f"<b>⚠️ Download quickly</b>\n\nTo avoid copyright issues, this file will be removed in <b>{delete_hours} hours</b>.\nIf the link expires, get a fresh link from our website: {Config.WEBSITE_URL}",
-                    parse_mode=enums.ParseMode.HTML
-                )
-            except Exception:
-                pass
-        else:
+        if not sent_file_msg:
             await status_msg.edit_text("<b>❌ Error: Could not send file.</b>", parse_mode=enums.ParseMode.HTML)
-            
-    except FileReferenceExpired:
-        LOGGER.warning(f"FileReferenceExpired for {msg_id_to_send}.")
-        await status_msg.edit_text("<b>⏳ The file reference expired. Refreshing now. Please try again in 1 minute.</b>", parse_mode=enums.ParseMode.HTML)
-        asyncio.create_task(refresh_file_reference(client, msg_id_to_send))
-        
-    except (UserIsBlocked, PeerIdInvalid):
-        LOGGER.warning(f"User {user_id} has blocked the bot.")
+            return
+
+        # Attempt to claim token atomically now that send succeeded
+        claimed = True
+        if SETTINGS.get("single_use_tokens", True):
+            try:
+                claimed = await claim_token_atomically(token_raw, user_id)
+            except Exception as e:
+                LOGGER.error(f"Error claiming token after send: {e}", exc_info=True)
+                claimed = False
+
+        if not claimed:
+            # Token was already used by someone else — inform user and delete the message we just sent to avoid leakage
+            try:
+                # try to delete the message we just sent
+                await bot.delete_messages(chat_id=user_id, message_ids=sent_file_msg.id)
+            except Exception:
+                pass
+            await status_msg.edit_text("<b>❌ This link has already been used by another user.</b>\n\nPlease get a fresh link from the website.", parse_mode=enums.ParseMode.HTML)
+            return
+
+        # Log for auto-deletion & increment daily count
+        await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
+        await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
         try:
             await status_msg.delete()
         except Exception:
             pass
-            
+
+        delete_hours = SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS)
+        try:
+            await sent_file_msg.reply_text(
+                f"<b>⚠️ Download quickly</b>\n\nTo avoid copyright issues, this file will be removed in <b>{delete_hours} hours</b>.\nIf the link expires, get a fresh link from our website: {Config.WEBSITE_URL}",
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+    except FileReferenceExpired:
+        LOGGER.warning(f"FileReferenceExpired for {msg_id_to_send}. Triggering refresh.")
+        try:
+            await status_msg.edit_text("<b>⏳ The file reference expired. Refreshing now. Please try again in 1 minute.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+        asyncio.create_task(refresh_file_reference(client, msg_id_to_send))
+    except (UserIsBlocked, PeerIdInvalid):
+        LOGGER.warning(f"User {user_id} has blocked the bot or peer invalid.")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
     except FloodWait as e:
         wait = int(e.x) if hasattr(e, "x") else int(getattr(e, "value", 10))
         LOGGER.warning(f"FloodWait {wait}s while sending to {user_id}.")
-        await status_msg.edit_text(f"<b>Flood wait: please wait {wait} seconds.</b>", parse_mode=enums.ParseMode.HTML)
+        try:
+            await status_msg.edit_text(f"<b>Flood wait: please wait {wait} seconds.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
         await asyncio.sleep(wait + 1)
         try:
             await status_msg.delete()
         except Exception:
             pass
-            
     except Exception as e:
         LOGGER.error(f"Failed to send message {msg_id_to_send} to {user_id}: {e}", exc_info=True)
         try:
@@ -879,7 +904,35 @@ async def start_command_handler(client: Client, message: Message):
         except Exception:
             pass
 
-# ---------- background tasks ----------
+# -----------------------------
+# Log sent file and auto-delete
+# -----------------------------
+async def log_sent_file_for_deletion(user_id: int, message_obj: Message, original_message_id: int):
+    try:
+        delete_at = datetime.now(timezone.utc) + timedelta(hours=SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS))
+        file_name = None
+        if getattr(message_obj, "document", None) and getattr(message_obj.document, "file_name", None):
+            file_name = message_obj.document.file_name
+        elif getattr(message_obj, "audio", None) and getattr(message_obj.audio, "title", None):
+            file_name = message_obj.audio.title
+        elif message_obj.caption:
+            file_name = message_obj.caption.strip().split("\n", 1)[0][:200]
+        if not file_name:
+            file_name = "your file"
+        await sent_files_log_col.insert_one({
+            "user_id": user_id,
+            "telegram_message_id": message_obj.id,
+            "log_channel_message_id": original_message_id,
+            "file_name": file_name,
+            "sent_at": datetime.now(timezone.utc),
+            "delete_at": delete_at
+        })
+    except Exception as e:
+        LOGGER.error(f"Failed to log sent file: {e}", exc_info=True)
+
+# -----------------------------
+# Background tasks
+# -----------------------------
 async def auto_delete_task():
     await asyncio.sleep(60)
     LOGGER.info("Auto-delete task started.")
@@ -929,98 +982,127 @@ async def daily_limit_reset_task():
         except Exception as e:
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
-# --------------------------------------------------------------------------------
-# --- MAIN STARTUP FUNCTION (V4.3) ---
-# --------------------------------------------------------------------------------
+# -----------------------------
+# Web server handlers (health)
+# -----------------------------
+routes = web.RouteTableDef()
 
+@routes.get('/')
+async def root_handler(request):
+    uptime = timedelta(seconds=int(time.time() - start_time))
+    bot_username = "Unknown"
+    try:
+        if bot.is_connected:
+            me = await bot.get_me()
+            bot_username = f"@{me.username}"
+    except Exception:
+        pass
+    return web.Response(text=f"Bot is alive!\nBot Username: {bot_username}\nUptime: {uptime}", content_type='text/plain')
+
+@routes.get('/health')
+async def health_check_handler(request):
+    return web.Response(text="OK", content_type='text/plain')
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
+    try:
+        await site.start()
+        LOGGER.info(f"Web server started on port {Config.PORT}.")
+    except Exception as e:
+        LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
+        if bot.is_connected:
+            await bot.stop()
+        sys.exit(1)
+
+# -----------------------------
+# Token inspector admin command (for debugging)
+# -----------------------------
+@bot.on_message(filters.command("inspect_token") & filters.user(Config.ADMIN_IDS) & filters.private)
+async def inspect_token_cmd(client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /inspect_token <token>", parse_mode=enums.ParseMode.HTML)
+        return
+    token = message.text.split(" ", 1)[1].strip()
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(token + padding).decode()
+    except Exception as e:
+        await message.reply_text(f"Decode error: {e}", parse_mode=enums.ParseMode.HTML)
+        return
+    import json
+    h = token_hash_raw(raw)
+    doc = await tokens_col.find_one({"hash": h})
+    await message.reply_text(f"<pre>{raw}</pre>\n\nhash: {h}\nDB record: {json.dumps(doc, default=str, indent=2)}", parse_mode=enums.ParseMode.HTML)
+
+# -----------------------------
+# Startup and lifecycle
+# -----------------------------
 async def main_startup_logic():
-    """Contains the main startup logic for the application."""
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.3 (Robust Startup + DB Fix)...")
-    
+    LOGGER.info("Starting File Sender Bot V4.5")
     await load_settings_from_db()
     await create_db_indices()
-    
     try:
         await bot.start()
         bot_info = await bot.get_me()
         LOGGER.info(f"Bot @{bot_info.username} started.")
     except Exception as e:
-        LOGGER.critical(f"FATAL: Failed to start bot: {e}", exc_info=True)
+        LOGGER.critical(f"Failed to start bot: {e}", exc_info=True)
         sys.exit(1)
-        
-    # Start background tasks
+    # Background tasks
     asyncio.create_task(auto_delete_task())
     asyncio.create_task(daily_limit_reset_task())
-    
-    # Start the web server (for health checks)
+    # Web server
     await start_web_server()
-    
-    # Send startup message to admin
+    # Notify admin
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.3) started.</b>", parse_mode=enums.ParseMode.HTML)
-        except Exception as e:
-            LOGGER.warning(f"Could not notify admin: {e}")
-            
-    LOGGER.info("Bot and Web Server are now running. Waiting for exit signal...")
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.5) started.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+    LOGGER.info("Bot and web server running.")
     await asyncio.Event().wait()
 
-# --------------------------------------------------------------------------------
-# --- APPLICATION LIFECYCLE (V4.3 - Robust Loop) ---
-# --------------------------------------------------------------------------------
-
+# Graceful shutdown handler
 if __name__ == "__main__":
-    
     loop = asyncio.get_event_loop()
 
     async def shutdown_handler(sig):
-        """Graceful shutdown handler for SIGINT and SIGTERM."""
-        LOGGER.info(f"Received exit signal {sig.name}. Shutting down gracefully...")
-        
+        LOGGER.info(f"Received exit signal {sig.name}. Shutting down...")
         if bot and bot.is_connected:
-            LOGGER.info("Stopping Pyrogram bot client...")
             try:
                 await bot.stop()
-            except Exception as e:
-                LOGGER.error(f"Error stopping bot: {e}")
-        
+            except Exception:
+                pass
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
         if tasks:
-            LOGGER.info(f"Cancelling {len(tasks)} outstanding tasks...")
+            LOGGER.info(f"Cancelling {len(tasks)} tasks...")
             [task.cancel() for task in tasks]
             await asyncio.gather(*tasks, return_exceptions=True)
-        
-        LOGGER.info("Stopping event loop.")
         loop.stop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(shutdown_handler(s))
-            )
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_handler(s)))
         except NotImplementedError:
             LOGGER.warning(f"Signal handling for {sig.name} not supported on this platform.")
 
     try:
-        LOGGER.info("Application starting event loop...")
-        
         loop.run_until_complete(main_startup_logic())
-        
         loop.run_forever()
-        
     except KeyboardInterrupt:
         LOGGER.info("KeyboardInterrupt received. Shutting down...")
         if not loop.is_running():
             asyncio.run(shutdown_handler(signal.SIGINT))
-            
     except Exception as e:
         LOGGER.critical(f"A critical error forced the application to stop: {e}", exc_info=True)
-        
     finally:
-        LOGGER.info("Event loop stopped. Final cleanup...")
+        LOGGER.info("Cleanup and exit.")
         if loop.is_running():
             loop.stop()
         if not loop.is_closed():
