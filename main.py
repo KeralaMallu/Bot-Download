@@ -1,8 +1,8 @@
-# --- main.py (V4.2 - Robust Startup Logic) ---
+# --- main.py (V4.3 - Correct DB Name Fix) ---
 """
-KeralaCaptain File Sender Bot - V4.2 (Robust Startup)
-Integrates V4.1 features with a robust event loop and signal handling
-for stable deployment on platforms like Koyeb/Render.
+KeralaCaptain File Sender Bot - V4.3 (Robust Startup + DB Fix)
+- Fixes fallback database name to 'KeralaCaptainBotDB' as per user's config.
+- Integrates V4.1 features with a robust event loop and signal handling.
 """
 
 import os
@@ -14,7 +14,7 @@ import hashlib
 import asyncio
 import logging
 import sys
-import signal  # <-- NEW: Import for signal handling
+import signal
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
@@ -84,20 +84,30 @@ try:
     db_client = AsyncIOMotorClient(Config.MONGO_URI)
     try:
         db = db_client.get_default_database()
+        if db is None:
+             raise Exception("No default DB found in URI, using fallback.")
     except Exception:
         parsed = urlparse(Config.MONGO_URI)
         path = parsed.path or ""
         if path.startswith("/"):
             dbname = unquote(path[1:].split("/", 1)[0].split("?", 1)[0])
-            db = db_client[dbname] if dbname else db_client['KeralaCaptainBotDB_V4']
+            #
+            # --- ⚠️⚠️⚠️ ഇതാണ് പ്രധാന തിരുത്ത് (THE FIX) ⚠️⚠️⚠️ ---
+            #
+            # നിങ്ങളുടെ ശരിയായ ഡാറ്റാബേസ് പേര് 'KeralaCaptainBotDB' (Source 12)
+            # ഞാൻ ഇവിടെ fallback ആയി ചേർക്കുന്നു.
+            #
+            db = db_client[dbname] if dbname else db_client['KeralaCaptainBotDB']
         else:
-            db = db_client['KeralaCaptainBotDB_V4']
+            # ഇവിടെയും ശരിയായ പേര് ചേർക്കുന്നു
+            db = db_client['KeralaCaptainBotDB']
+            
     LOGGER.info(f"Connected to MongoDB: {db.name}")
 except Exception as e:
     LOGGER.critical(f"Could not connect to MongoDB: {e}", exc_info=True)
     sys.exit(1)
 
-# Collections
+# Collections (ഇപ്പോൾ ഇവ 'KeralaCaptainBotDB'-ൽ നിന്നായിരിക്കും)
 media_collection = db['media']
 users_col = db['users']
 sent_files_log_col = db['sent_files_log']
@@ -110,7 +120,7 @@ SETTINGS = {}
 
 # Bot client
 bot = Client(
-    name="KeralaCaptainSenderV4_2",
+    name="KeralaCaptainSenderV4_3", # Version changed
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
@@ -160,11 +170,9 @@ async def start_web_server():
         LOGGER.info(f"Web server started successfully on port {Config.PORT}.")
     except Exception as e:
         LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
-        # On Koyeb, this will fail the health check and restart the container
-        # This is a critical failure, so we'll stop the bot
         if bot.is_connected:
             await bot.stop()
-        sys.exit(1) # Exit if web server fails to bind
+        sys.exit(1)
 
 # --------------------------------------------------------------------------------
 # --- DATABASE & BOT LOGIC (V4.1 - മാറ്റമില്ലാതെ) ---
@@ -291,6 +299,7 @@ async def clear_admin_conv(chat_id):
 # ---------- media helpers ----------
 async def get_media_by_post_id(post_id: int):
     try:
+        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷനിൽ നോക്കും
         return await media_collection.find_one({"wp_post_id": post_id})
     except Exception as e:
         LOGGER.error(f"Error fetching media by post_id {post_id}: {e}", exc_info=True)
@@ -298,6 +307,7 @@ async def get_media_by_post_id(post_id: int):
 
 async def update_media_links_in_db(post_id: int, new_message_ids, stream_link: str):
     try:
+        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷൻ അപ്ഡേറ്റ് ചെയ്യും
         await media_collection.update_one({"wp_post_id": post_id}, {"$set": {"message_ids": new_message_ids, "stream_link": stream_link}})
         LOGGER.info(f"Updated media links for post {post_id}")
     except Exception as e:
@@ -305,6 +315,7 @@ async def update_media_links_in_db(post_id: int, new_message_ids, stream_link: s
 
 async def get_post_id_from_msg_id(msg_id: int):
     try:
+        # ഇപ്പോൾ ഇത് ശരിയായ 'media' കളക്ഷനിൽ നോക്കും
         doc = await media_collection.find_one({"message_ids": {"$elemMatch": {"id": msg_id}}})
         if doc:
             return doc.get('wp_post_id')
@@ -396,7 +407,6 @@ async def verify_token(token_b64: str, expected_bot_username: str) -> int | None
             if used:
                 LOGGER.warning("Token already used.")
                 return None
-            # mark used preemptively to reduce race (we will update used_by later)
             await mark_token_used(token_raw, user_id=None)
         else:
             h = token_hash_raw(token_raw)
@@ -637,7 +647,6 @@ async def admin_conv_handler(client: Client, message: Message):
     chat_id = message.from_user.id
     conv = await get_admin_conv(chat_id)
     if not conv or not conv.get("stage"):
-        # This catches any random text from an admin who is NOT in a conversation
         await message.reply_text("I don't understand. Use /admin to open the control panel.", parse_mode=enums.ParseMode.HTML)
         return
 
@@ -670,7 +679,6 @@ async def admin_conv_handler(client: Client, message: Message):
             if hours < 1:
                 raise ValueError("Must be >= 1")
             await update_db_setting("file_delete_hours", hours)
-            # Update Config object as well for the current session
             Config.FILE_DELETE_HOURS = hours
             await message.reply_text(f"✅ File delete time set to <b>{hours} hours</b>.", parse_mode=enums.ParseMode.HTML)
 
@@ -922,14 +930,14 @@ async def daily_limit_reset_task():
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
 # --------------------------------------------------------------------------------
-# --- MAIN STARTUP FUNCTION (V4.2) ---
+# --- MAIN STARTUP FUNCTION (V4.3) ---
 # --------------------------------------------------------------------------------
 
 async def main_startup_logic():
     """Contains the main startup logic for the application."""
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.2 (Robust Startup)...")
+    LOGGER.info("Starting File Sender Bot V4.3 (Robust Startup + DB Fix)...")
     
     await load_settings_from_db()
     await create_db_indices()
@@ -952,29 +960,25 @@ async def main_startup_logic():
     # Send startup message to admin
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.2) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.3) started.</b>", parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             LOGGER.warning(f"Could not notify admin: {e}")
             
     LOGGER.info("Bot and Web Server are now running. Waiting for exit signal...")
-    # Keep the main coroutine alive indefinitely
     await asyncio.Event().wait()
 
 # --------------------------------------------------------------------------------
-# --- NEW: APPLICATION LIFECYCLE (V4.2 - Robust Loop) ---
-# --- (Based on your provided snippet) ---
+# --- APPLICATION LIFECYCLE (V4.3 - Robust Loop) ---
 # --------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     
-    # Get the event loop
     loop = asyncio.get_event_loop()
 
     async def shutdown_handler(sig):
         """Graceful shutdown handler for SIGINT and SIGTERM."""
         LOGGER.info(f"Received exit signal {sig.name}. Shutting down gracefully...")
         
-        # Stop the bot
         if bot and bot.is_connected:
             LOGGER.info("Stopping Pyrogram bot client...")
             try:
@@ -982,18 +986,15 @@ if __name__ == "__main__":
             except Exception as e:
                 LOGGER.error(f"Error stopping bot: {e}")
         
-        # Cancel all other running tasks
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
         if tasks:
             LOGGER.info(f"Cancelling {len(tasks)} outstanding tasks...")
             [task.cancel() for task in tasks]
             await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Stop the event loop
         LOGGER.info("Stopping event loop.")
         loop.stop()
 
-    # Add signal handlers for graceful shutdown (SIGINT = Ctrl+C, SIGTERM = Koyeb stop)
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(
@@ -1006,15 +1007,12 @@ if __name__ == "__main__":
     try:
         LOGGER.info("Application starting event loop...")
         
-        # Run the main startup logic (which starts bot, web server, and tasks)
         loop.run_until_complete(main_startup_logic())
         
-        # Run the loop forever to keep all tasks (bot, web, background) alive
         loop.run_forever()
         
     except KeyboardInterrupt:
         LOGGER.info("KeyboardInterrupt received. Shutting down...")
-        # This is a fallback if signal handler fails
         if not loop.is_running():
             asyncio.run(shutdown_handler(signal.SIGINT))
             
@@ -1026,7 +1024,6 @@ if __name__ == "__main__":
         if loop.is_running():
             loop.stop()
         if not loop.is_closed():
-            # Shutdown async generators
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
         LOGGER.info("Shutdown complete.")
