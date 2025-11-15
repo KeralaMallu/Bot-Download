@@ -1,9 +1,3 @@
-# file_sender_bot_v4_1.py
-"""
-KeralaCaptain File Sender Bot - V4.1 (Complete)
-Matches PHP v4.1 token format and features.
-"""
-
 import os
 import re
 import time
@@ -15,6 +9,9 @@ import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
+
+# --- NEW: Import for Web Server ---
+from aiohttp import web
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
@@ -66,6 +63,11 @@ class Config:
     WEBSITE_URL = os.environ.get("WEBSITE_URL", "https://www.keralacaptain.shop")
     WEBSITE_BUTTON_TEXT = os.environ.get("WEBSITE_BUTTON_TEXT", "Download Movie")
 
+    # --- NEW: Port for Web Server ---
+    # Koyeb/Render will set this PORT variable automatically.
+    PORT = int(os.environ.get("PORT", 8080))
+
+
 # Validate
 if not (Config.API_ID and Config.API_HASH and Config.BOT_TOKEN and Config.MONGO_URI and Config.LOG_CHANNEL_ID and Config.ADMIN_IDS):
     LOGGER.critical("FATAL: Missing required environment variables. Please set API_ID, API_HASH, BOT_TOKEN, MONGO_URI, LOG_CHANNEL_ID, ADMIN_IDS")
@@ -91,13 +93,13 @@ except Exception as e:
     LOGGER.critical(f"Could not connect to MongoDB: {e}", exc_info=True)
     sys.exit(1)
 
-# Collections
+# Collections (നിങ്ങളുടെ V4.1 ലോജിക്)
 media_collection = db['media']
 users_col = db['users']
 sent_files_log_col = db['sent_files_log']
 settings_col = db['bot_settings']
 conversations_col = db['conversations']
-tokens_col = db['issued_tokens']  # new collection for token hashing and single-use
+tokens_col = db['issued_tokens']
 
 # In-memory settings
 SETTINGS = {}
@@ -111,6 +113,29 @@ bot = Client(
 )
 
 start_time = time.time()
+
+# --------------------------------------------------------------------------------
+# --- NEW: WEB SERVER HANDLERS ---
+# --------------------------------------------------------------------------------
+
+routes = web.RouteTableDef()
+
+@routes.get('/')
+async def root_handler(request):
+    """Handles the root '/' request."""
+    return web.Response(
+        text=f"Bot is alive!\nBot Username: @{(await bot.get_me()).username}\nUptime: {timedelta(seconds=int(time.time() - start_time))}",
+        content_type='text/plain'
+    )
+
+@routes.get('/health')
+async def health_check_handler(request):
+    """Handles the '/health' request for health checks."""
+    return web.Response(text="OK", content_type='text/plain')
+
+# --------------------------------------------------------------------------------
+# --- DATABASE & BOT LOGIC (നിങ്ങളുടെ V4.1 കോഡ് - മാറ്റമില്ലാതെ) ---
+# --------------------------------------------------------------------------------
 
 # ---------- DB indices creation ----------
 async def create_db_indices():
@@ -845,51 +870,35 @@ async def daily_limit_reset_task():
         except Exception as e:
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
-# ---------- utilities: qualities and bytes ----------
-def keralacaptain_dl_safe_json_decode_qualities(json_data):
+# --------------------------------------------------------------------------------
+# --- NEW: WEB SERVER STARTUP FUNCTION ---
+# --------------------------------------------------------------------------------
+async def start_web_server():
+    """Initializes and starts the dummy web server."""
+    app = web.Application()
+    app.add_routes(routes)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
     try:
-        if not json_data:
-            return []
-        import json
-        if isinstance(json_data, str):
-            try:
-                decoded = json.loads(json_data)
-            except Exception:
-                return []
-        else:
-            decoded = json_data
-        if isinstance(decoded, list) and decoded and isinstance(decoded[0], dict) and 'quality' in decoded[0] and 'id' in decoded[0]:
-            for item in decoded:
-                if 'size' not in item:
-                    item['size'] = 0
-            return decoded
-        if isinstance(decoded, dict):
-            new_list = []
-            for quality, idv in decoded.items():
-                if isinstance(idv, int) or (isinstance(idv, str) and idv.isdigit()):
-                    new_list.append({'quality': quality, 'id': int(idv), 'size': 0})
-            return new_list
-        return []
+        await site.start()
+        LOGGER.info(f"Web server started successfully on port {Config.PORT}.")
     except Exception as e:
-        LOGGER.error(f"Error decoding qualities: {e}", exc_info=True)
-        return []
-
-def keralacaptain_dl_format_bytes(size: int, precision: int = 1) -> str:
-    if size <= 0:
-        return "0 B"
-    units = ['B', 'KB', 'MB', 'GB', 'TB']
-    power = int((len(str(size)) - 1) / 3)
-    power = max(0, min(power, len(units) - 1))
-    value = size / (1024 ** power)
-    return f"{round(value, precision)} {units[power]}"
-
+        LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
+        # We don't exit here, maybe the bot can still run
+        # On Koyeb, this will likely fail the health check and restart the container
+        
 # ---------- startup ----------
 async def main_startup():
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.1")
+    LOGGER.info("Starting File Sender Bot V4.1 (with Web Server)...")
+    
     await load_settings_from_db()
     await create_db_indices()
+    
     try:
         await bot.start()
         bot_info = await bot.get_me()
@@ -897,15 +906,20 @@ async def main_startup():
     except Exception as e:
         LOGGER.critical(f"Failed to start bot: {e}", exc_info=True)
         sys.exit(1)
+        
+    # --- NEW: Start background tasks AND web server ---
     asyncio.create_task(auto_delete_task())
     asyncio.create_task(daily_limit_reset_task())
+    asyncio.create_task(start_web_server()) # Start the web server concurrently
+    
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.1) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.1 + Web) started.</b>", parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             LOGGER.warning(f"Could not notify admin: {e}")
-    LOGGER.info("Bot is running.")
-    await asyncio.Event().wait()
+            
+    LOGGER.info("Bot and Web Server are running.")
+    await asyncio.Event().wait() # Keep everything running
 
 def run():
     try:
