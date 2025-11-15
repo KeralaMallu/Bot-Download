@@ -1,3 +1,10 @@
+# --- main.py (V4.2 - Robust Startup Logic) ---
+"""
+KeralaCaptain File Sender Bot - V4.2 (Robust Startup)
+Integrates V4.1 features with a robust event loop and signal handling
+for stable deployment on platforms like Koyeb/Render.
+"""
+
 import os
 import re
 import time
@@ -7,10 +14,11 @@ import hashlib
 import asyncio
 import logging
 import sys
+import signal  # <-- NEW: Import for signal handling
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
-# --- NEW: Import for Web Server ---
+# Import for Web Server
 from aiohttp import web
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -40,7 +48,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s] - 
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# Config
+# Config (V4.1 Config)
 class Config:
     API_ID = int(os.environ.get("API_ID", 0))
     API_HASH = os.environ.get("API_HASH", "")
@@ -57,22 +65,18 @@ class Config:
 
     KC_LINK_SECRET = os.environ.get("KC_LINK_SECRET", "KCS3cR3t_v4_d3f6a8b1e9c2a5d4e7f8b1a3c5e")
 
-    TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", 1800))  # default 30m
+    TOKEN_EXPIRY_SECONDS = int(os.environ.get("TOKEN_EXPIRY_SECONDS", 1800))
     FILE_DELETE_HOURS = int(os.environ.get("FILE_DELETE_HOURS", 12))
 
     WEBSITE_URL = os.environ.get("WEBSITE_URL", "https://www.keralacaptain.shop")
     WEBSITE_BUTTON_TEXT = os.environ.get("WEBSITE_BUTTON_TEXT", "Download Movie")
 
-    # --- NEW: Port for Web Server ---
-    # Koyeb/Render will set this PORT variable automatically.
     PORT = int(os.environ.get("PORT", 8080))
 
 
 # Validate
 if not (Config.API_ID and Config.API_HASH and Config.BOT_TOKEN and Config.MONGO_URI and Config.LOG_CHANNEL_ID and Config.ADMIN_IDS):
-    LOGGER.critical("FATAL: Missing required environment variables. Please set API_ID, API_HASH, BOT_TOKEN, MONGO_URI, LOG_CHANNEL_ID, ADMIN_IDS")
-    if Config.KC_LINK_SECRET == "KCS3cR3t_v4_d3f6a8b1e9c2a5d4e7f8b1a3c5e":
-        LOGGER.warning("WARNING: Using default KC_LINK_SECRET. Change it in .env.")
+    LOGGER.critical("FATAL: Missing required environment variables.")
     sys.exit(1)
 
 # MongoDB
@@ -93,7 +97,7 @@ except Exception as e:
     LOGGER.critical(f"Could not connect to MongoDB: {e}", exc_info=True)
     sys.exit(1)
 
-# Collections (നിങ്ങളുടെ V4.1 ലോജിക്)
+# Collections
 media_collection = db['media']
 users_col = db['users']
 sent_files_log_col = db['sent_files_log']
@@ -106,7 +110,7 @@ SETTINGS = {}
 
 # Bot client
 bot = Client(
-    name="KeralaCaptainSenderV4_1",
+    name="KeralaCaptainSenderV4_2",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
@@ -115,7 +119,7 @@ bot = Client(
 start_time = time.time()
 
 # --------------------------------------------------------------------------------
-# --- NEW: WEB SERVER HANDLERS ---
+# --- WEB SERVER HANDLERS ---
 # --------------------------------------------------------------------------------
 
 routes = web.RouteTableDef()
@@ -123,8 +127,17 @@ routes = web.RouteTableDef()
 @routes.get('/')
 async def root_handler(request):
     """Handles the root '/' request."""
+    uptime = timedelta(seconds=int(time.time() - start_time))
+    bot_username = "Unknown (starting...)"
+    if bot.is_connected:
+        try:
+            me = await bot.get_me()
+            bot_username = f"@{me.username}"
+        except Exception:
+            bot_username = "Error fetching username"
+            
     return web.Response(
-        text=f"Bot is alive!\nBot Username: @{(await bot.get_me()).username}\nUptime: {timedelta(seconds=int(time.time() - start_time))}",
+        text=f"Bot is alive!\nBot Username: {bot_username}\nUptime: {uptime}",
         content_type='text/plain'
     )
 
@@ -133,8 +146,28 @@ async def health_check_handler(request):
     """Handles the '/health' request for health checks."""
     return web.Response(text="OK", content_type='text/plain')
 
+async def start_web_server():
+    """Initializes and starts the dummy web server."""
+    app = web.Application()
+    app.add_routes(routes)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
+    try:
+        await site.start()
+        LOGGER.info(f"Web server started successfully on port {Config.PORT}.")
+    except Exception as e:
+        LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
+        # On Koyeb, this will fail the health check and restart the container
+        # This is a critical failure, so we'll stop the bot
+        if bot.is_connected:
+            await bot.stop()
+        sys.exit(1) # Exit if web server fails to bind
+
 # --------------------------------------------------------------------------------
-# --- DATABASE & BOT LOGIC (നിങ്ങളുടെ V4.1 കോഡ് - മാറ്റമില്ലാതെ) ---
+# --- DATABASE & BOT LOGIC (V4.1 - മാറ്റമില്ലാതെ) ---
 # --------------------------------------------------------------------------------
 
 # ---------- DB indices creation ----------
@@ -599,15 +632,13 @@ async def cancel_conv_handler(client: Client, message: Message):
     await message.reply_text("Operation cancelled.", parse_mode=enums.ParseMode.HTML)
     await admin_panel_handler(client, message)
 
-@bot.on_message(filters.private & filters.user(Config.ADMIN_IDS))
+@bot.on_message(filters.private & filters.user(Config.ADMIN_IDS) & ~filters.command(["start", "admin", "settings", "cancel"]))
 async def admin_conv_handler(client: Client, message: Message):
     chat_id = message.from_user.id
     conv = await get_admin_conv(chat_id)
     if not conv or not conv.get("stage"):
-        if message.text and message.text.startswith("/start"):
-            await start_command_handler(client, message)
-        else:
-            await message.reply_text("I don't understand. Use /admin to open the control panel.", parse_mode=enums.ParseMode.HTML)
+        # This catches any random text from an admin who is NOT in a conversation
+        await message.reply_text("I don't understand. Use /admin to open the control panel.", parse_mode=enums.ParseMode.HTML)
         return
 
     stage = conv["stage"]
@@ -639,7 +670,9 @@ async def admin_conv_handler(client: Client, message: Message):
             if hours < 1:
                 raise ValueError("Must be >= 1")
             await update_db_setting("file_delete_hours", hours)
-            await message.reply_text(f"✅ File delete time set to <b>{hours} hours</b>. Background tasks will pick this up.", parse_mode=enums.ParseMode.HTML)
+            # Update Config object as well for the current session
+            Config.FILE_DELETE_HOURS = hours
+            await message.reply_text(f"✅ File delete time set to <b>{hours} hours</b>.", parse_mode=enums.ParseMode.HTML)
 
         elif stage == "admin_ban":
             user_id = int(message.text.strip())
@@ -706,10 +739,12 @@ async def start_command_handler(client: Client, message: Message):
     if user_id in Config.ADMIN_IDS:
         await admin_panel_handler(client, message)
         return
+    
     user_data = await get_user_data(user_id)
     if user_data.get("is_banned", False):
         await message.reply_text("<b>❌ You are banned from using this bot.</b>", parse_mode=enums.ParseMode.HTML)
         return
+    
     if len(message.command) == 1:
         welcome_text = (
             "<b>👋 Welcome!</b>\n\n"
@@ -718,10 +753,13 @@ async def start_command_handler(client: Client, message: Message):
         )
         await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(Config.WEBSITE_BUTTON_TEXT, url=Config.WEBSITE_URL)]]), parse_mode=enums.ParseMode.HTML)
         return
+    
     token = message.text.split(" ", 1)[1].strip()
     bot_info = await bot.get_me()
     bot_username = bot_info.username or ""
+    
     msg_id_to_send = await verify_token(token, bot_username)
+    
     if not msg_id_to_send:
         await message.reply_text(
             "<b>⏳ Link expired or invalid.</b>\n\n"
@@ -730,7 +768,9 @@ async def start_command_handler(client: Client, message: Message):
             parse_mode=enums.ParseMode.HTML
         )
         return
+        
     LOGGER.info(f"User {user_id} requested message {msg_id_to_send} with valid token.")
+    
     if SETTINGS.get("force_sub_enabled"):
         is_joined = await check_force_sub(user_id)
         if not is_joined:
@@ -758,11 +798,14 @@ async def start_command_handler(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
             return
+            
     daily_limit = SETTINGS.get("daily_limit", 5)
     if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
         await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
         return
+        
     status_msg = await message.reply_text("<b>✅ Link verified. Sending file, please wait...</b>", parse_mode=enums.ParseMode.HTML)
+    
     try:
         sent_file_msg = await client.copy_message(
             chat_id=user_id,
@@ -770,6 +813,7 @@ async def start_command_handler(client: Client, message: Message):
             message_id=msg_id_to_send,
             protect_content=SETTINGS.get("protect_content_enabled", True)
         )
+        
         if sent_file_msg:
             try:
                 token_raw, _ = parse_token_raw(token)
@@ -778,12 +822,15 @@ async def start_command_handler(client: Client, message: Message):
                     await tokens_col.update_one({"hash": h}, {"$set": {"used": True, "used_by": user_id, "used_at": datetime.now(timezone.utc)}}, upsert=True)
             except Exception as e:
                 LOGGER.warning(f"Could not update token used_by: {e}", exc_info=True)
+            
             await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
             await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
+            
             try:
                 await status_msg.delete()
             except Exception:
                 pass
+                
             delete_hours = SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS)
             try:
                 await sent_file_msg.reply_text(
@@ -794,16 +841,19 @@ async def start_command_handler(client: Client, message: Message):
                 pass
         else:
             await status_msg.edit_text("<b>❌ Error: Could not send file.</b>", parse_mode=enums.ParseMode.HTML)
+            
     except FileReferenceExpired:
         LOGGER.warning(f"FileReferenceExpired for {msg_id_to_send}.")
         await status_msg.edit_text("<b>⏳ The file reference expired. Refreshing now. Please try again in 1 minute.</b>", parse_mode=enums.ParseMode.HTML)
         asyncio.create_task(refresh_file_reference(client, msg_id_to_send))
+        
     except (UserIsBlocked, PeerIdInvalid):
         LOGGER.warning(f"User {user_id} has blocked the bot.")
         try:
             await status_msg.delete()
         except Exception:
             pass
+            
     except FloodWait as e:
         wait = int(e.x) if hasattr(e, "x") else int(getattr(e, "value", 10))
         LOGGER.warning(f"FloodWait {wait}s while sending to {user_id}.")
@@ -813,6 +863,7 @@ async def start_command_handler(client: Client, message: Message):
             await status_msg.delete()
         except Exception:
             pass
+            
     except Exception as e:
         LOGGER.error(f"Failed to send message {msg_id_to_send} to {user_id}: {e}", exc_info=True)
         try:
@@ -871,30 +922,14 @@ async def daily_limit_reset_task():
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
 # --------------------------------------------------------------------------------
-# --- NEW: WEB SERVER STARTUP FUNCTION ---
+# --- MAIN STARTUP FUNCTION (V4.2) ---
 # --------------------------------------------------------------------------------
-async def start_web_server():
-    """Initializes and starts the dummy web server."""
-    app = web.Application()
-    app.add_routes(routes)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
-    try:
-        await site.start()
-        LOGGER.info(f"Web server started successfully on port {Config.PORT}.")
-    except Exception as e:
-        LOGGER.error(f"Failed to start web server: {e}", exc_info=True)
-        # We don't exit here, maybe the bot can still run
-        # On Koyeb, this will likely fail the health check and restart the container
-        
-# ---------- startup ----------
-async def main_startup():
+
+async def main_startup_logic():
+    """Contains the main startup logic for the application."""
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.1 (with Web Server)...")
+    LOGGER.info("Starting File Sender Bot V4.2 (Robust Startup)...")
     
     await load_settings_from_db()
     await create_db_indices()
@@ -904,35 +939,94 @@ async def main_startup():
         bot_info = await bot.get_me()
         LOGGER.info(f"Bot @{bot_info.username} started.")
     except Exception as e:
-        LOGGER.critical(f"Failed to start bot: {e}", exc_info=True)
+        LOGGER.critical(f"FATAL: Failed to start bot: {e}", exc_info=True)
         sys.exit(1)
         
-    # --- NEW: Start background tasks AND web server ---
+    # Start background tasks
     asyncio.create_task(auto_delete_task())
     asyncio.create_task(daily_limit_reset_task())
-    asyncio.create_task(start_web_server()) # Start the web server concurrently
     
+    # Start the web server (for health checks)
+    await start_web_server()
+    
+    # Send startup message to admin
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.1 + Web) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.2) started.</b>", parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             LOGGER.warning(f"Could not notify admin: {e}")
             
-    LOGGER.info("Bot and Web Server are running.")
-    await asyncio.Event().wait() # Keep everything running
+    LOGGER.info("Bot and Web Server are now running. Waiting for exit signal...")
+    # Keep the main coroutine alive indefinitely
+    await asyncio.Event().wait()
 
-def run():
-    try:
-        asyncio.run(main_startup())
-    except KeyboardInterrupt:
-        LOGGER.info("Shutting down (KeyboardInterrupt).")
-    finally:
-        try:
-            if bot and bot.is_connected:
-                asyncio.get_event_loop().run_until_complete(bot.stop())
-        except Exception:
-            pass
-        LOGGER.info("Bot shutdown complete.")
+# --------------------------------------------------------------------------------
+# --- NEW: APPLICATION LIFECYCLE (V4.2 - Robust Loop) ---
+# --- (Based on your provided snippet) ---
+# --------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run()
+    
+    # Get the event loop
+    loop = asyncio.get_event_loop()
+
+    async def shutdown_handler(sig):
+        """Graceful shutdown handler for SIGINT and SIGTERM."""
+        LOGGER.info(f"Received exit signal {sig.name}. Shutting down gracefully...")
+        
+        # Stop the bot
+        if bot and bot.is_connected:
+            LOGGER.info("Stopping Pyrogram bot client...")
+            try:
+                await bot.stop()
+            except Exception as e:
+                LOGGER.error(f"Error stopping bot: {e}")
+        
+        # Cancel all other running tasks
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        if tasks:
+            LOGGER.info(f"Cancelling {len(tasks)} outstanding tasks...")
+            [task.cancel() for task in tasks]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Stop the event loop
+        LOGGER.info("Stopping event loop.")
+        loop.stop()
+
+    # Add signal handlers for graceful shutdown (SIGINT = Ctrl+C, SIGTERM = Koyeb stop)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(shutdown_handler(s))
+            )
+        except NotImplementedError:
+            LOGGER.warning(f"Signal handling for {sig.name} not supported on this platform.")
+
+    try:
+        LOGGER.info("Application starting event loop...")
+        
+        # Run the main startup logic (which starts bot, web server, and tasks)
+        loop.run_until_complete(main_startup_logic())
+        
+        # Run the loop forever to keep all tasks (bot, web, background) alive
+        loop.run_forever()
+        
+    except KeyboardInterrupt:
+        LOGGER.info("KeyboardInterrupt received. Shutting down...")
+        # This is a fallback if signal handler fails
+        if not loop.is_running():
+            asyncio.run(shutdown_handler(signal.SIGINT))
+            
+    except Exception as e:
+        LOGGER.critical(f"A critical error forced the application to stop: {e}", exc_info=True)
+        
+    finally:
+        LOGGER.info("Event loop stopped. Final cleanup...")
+        if loop.is_running():
+            loop.stop()
+        if not loop.is_closed():
+            # Shutdown async generators
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        LOGGER.info("Shutdown complete.")
