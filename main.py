@@ -1,12 +1,13 @@
-# main.py (V4.6) - KeralaCaptain File Sender Bot (Short-token support)
+# main.py (V4.6) - KeralaCaptain File Sender Bot (Short-token + API support)
 """
-Full bot script - V4.6
+Full bot script - V4.6 (with /api/create_token endpoint)
 - Accepts short token IDs (stored in MongoDB temp_tokens) via /start
 - Looks up temp_tokens, validates expiry and bot, atomically deletes the token (single-use),
   and sends the file to the user.
 - Preserves legacy long-token verification for backward compatibility.
 - Creates indices (TTL for temp_tokens.expiry), admin panel, broadcast, auto-delete, etc.
 - All user-facing messages use HTML parse mode.
+- INCLUDES: /api/create_token endpoint to allow PHP to request token creation.
 """
 
 import os
@@ -115,7 +116,7 @@ sent_files_log_col = db['sent_files_log']
 settings_col = db['bot_settings']
 conversations_col = db['conversations']
 issued_tokens_col = db['issued_tokens']  # legacy token hash store
-temp_tokens_col = db['temp_tokens']      # short-token collection created by PHP API
+temp_tokens_col = db['temp_tokens']      # short-token collection (created by PHP API or Bot API)
 
 # In-memory settings
 SETTINGS = {}
@@ -290,6 +291,11 @@ async def get_post_id_from_msg_id(msg_id: int):
                         return document.get('wp_post_id')
                     if isinstance(v, dict) and v.get('id') == msg_id:
                         return document.get('wp_post_id')
+            # Handle new list format
+            elif isinstance(message_ids_data, list):
+                for item in message_ids_data:
+                    if isinstance(item, dict) and item.get('id') == msg_id:
+                        return document.get('wp_post_id')
         return None
     except Exception as e:
         LOGGER.error(f"Error searching for post_id from msg_id {msg_id}: {e}", exc_info=True)
@@ -350,6 +356,66 @@ async def verify_token_basic(token_b64: str, expected_bot_username: str):
     except Exception as e:
         LOGGER.error(f"Token verification error: {e}", exc_info=True)
         return None, None
+
+# -----------------------------
+# NEW Short-token creation helpers (for Bot API)
+# -----------------------------
+
+async def kc_generate_short_id(length=9):
+    """Generate a base62 short token string from random bytes."""
+    alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    max_val = len(alphabet) - 1
+    try:
+        b_bytes = os.urandom(length)
+    except NotImplementedError:
+        # Fallback for systems without /dev/urandom
+        b_bytes = str(time.time()).encode() + os.urandom(length)
+    
+    result = ''
+    for i in range(length):
+        char_ord = b_bytes[i] if i < len(b_bytes) else (b_bytes[i % len(b_bytes)] + i) % 256
+        result += alphabet[char_ord % (max_val + 1)]
+    return result
+
+async def create_short_token_for_msg(message_id: int, bot_username: str, signature: str) -> (str | None):
+    """
+    Creates and inserts a single short token into temp_tokens_col.
+    Handles uniqueness collisions. Returns short_id or None on failure.
+    """
+    expiry_seconds = SETTINGS.get("token_expiry_seconds", Config.TOKEN_EXPIRY_SECONDS)
+    expiry_ts = int(time.time() + expiry_seconds)
+    expiry_dt = datetime.fromtimestamp(expiry_ts, timezone.utc)
+    nonce = hashlib.sha256(os.urandom(16)).hexdigest()[:16] # 16 char nonce
+
+    attempts = 0
+    short_id = None
+    
+    while attempts < 5:
+        short_id = await kc_generate_short_id()
+        doc = {
+            '_id': short_id,
+            'message_id': message_id,
+            'expiry': expiry_dt,
+            'expiry_ts': expiry_ts,
+            'bot': bot_username,
+            'nonce': nonce,
+            'signature': signature, # Store the signature from PHP for consistency
+            'created_at': datetime.now(timezone.utc),
+        }
+        try:
+            await temp_tokens_col.insert_one(doc)
+            # Success
+            return short_id
+        except DuplicateKeyError:
+            # Collision; try again
+            attempts += 1
+            await asyncio.sleep(0.01) # Small delay
+        except Exception as e:
+            LOGGER.error(f"API Token Insert Failed: {e}", exc_info=True)
+            return None
+    
+    LOGGER.error("Failed to generate unique short_id after 5 attempts.")
+    return None
 
 # -----------------------------
 # Short-token lookup (new flow)
@@ -428,6 +494,8 @@ async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
             return
         old_qualities = media_doc.get('message_ids', {})
         found_and_updated = False
+        new_qualities = None
+        
         if isinstance(old_qualities, list):
             new_qualities = []
             for item in old_qualities:
@@ -446,6 +514,7 @@ async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
                     break
         else:
             new_qualities = old_qualities
+            
         if found_and_updated:
             await update_media_links_in_db(post_id, new_qualities, media_doc.get('stream_link', ''))
     except Exception as e:
@@ -512,8 +581,16 @@ async def start_command_handler(client: Client, message: Message):
 
     # Admin /start goes to admin panel
     if user_id in Config.ADMIN_IDS:
-        await admin_panel_handler(client, message)
-        return
+        # Check if it's /start admin (for panel) or /start token (for testing)
+        text = (message.text or "").strip()
+        m = _START_RE.match(text)
+        token_group = m.group(1) if m else None
+        
+        if not token_group:
+            await admin_panel_handler(client, message)
+            return
+        # If admin uses /start with a token, let it pass through to test the token
+        LOGGER.info(f"Admin {user_id} is testing a start token...")
 
     # Basic user checks
     user_data = await get_user_data(user_id)
@@ -616,11 +693,12 @@ async def start_command_handler(client: Client, message: Message):
             )
             return
 
-    # Daily limit check
-    daily_limit = SETTINGS.get("daily_limit", 5)
-    if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
-        await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
-        return
+    # Daily limit check (skip for admins)
+    if user_id not in Config.ADMIN_IDS:
+        daily_limit = SETTINGS.get("daily_limit", 5)
+        if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
+            await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
+            return
 
     # Send file and then atomically claim the token (so we don't pre-mark and cause race)
     status_msg = await message.reply_text("<b>✅ Link verified. Sending file, please wait...</b>", parse_mode=enums.ParseMode.HTML)
@@ -687,9 +765,14 @@ async def start_command_handler(client: Client, message: Message):
                     await status_msg.edit_text("<b>❌ This link has already been used by another user.</b>\n\nPlease get a fresh link from the website.", parse_mode=enums.ParseMode.HTML)
                     return
 
-        # Log for auto deletion and increment daily count
-        await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
-        await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
+        # Log for auto deletion and increment daily count (don't count for admins)
+        if user_id not in Config.ADMIN_IDS:
+            await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
+            await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
+        else:
+             await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
+             LOGGER.info(f"Admin {user_id} downloaded a file. Daily count not incremented.")
+             
         try:
             await status_msg.delete()
         except Exception:
@@ -809,13 +892,31 @@ async def daily_limit_reset_task():
         LOGGER.info(f"Daily reset will run in {timedelta(seconds=wait_seconds)}")
         await asyncio.sleep(wait_seconds)
         try:
-            result = await users_col.update_many({"daily_file_count": {"$gt": 0}}, {"$set": {"daily_file_count": 0, "last_count_reset": datetime.now(timezone.utc).date().isoformat()}})
+            result = await users_col.update_many(
+                {"daily_file_count": {"$gt": 0}},
+                {"$set": {"daily_file_count": 0, "last_count_reset": datetime.now(timezone.utc).date().isoformat()}}
+            )
             LOGGER.info(f"Reset daily limits for {result.modified_count} users.")
         except Exception as e:
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
 # -----------------------------
-# Web server handlers (health)
+# Admin commands
+# -----------------------------
+# (Assuming admin_panel_handler, broadcast handlers etc. are in a separate file or you add them here)
+# Placeholder for admin panel
+@bot.on_message(filters.command("admin") & filters.user(Config.ADMIN_IDS) & filters.private)
+async def admin_panel_handler(client, message: Message):
+     await message.reply_text("Admin Panel (To be implemented)", reply_markup=get_main_admin_keyboard())
+
+# (You would add your other admin handlers for stats, settings, broadcast, ban, unban here)
+# ...
+# ... (all other admin callback handlers go here)
+# ...
+
+
+# -----------------------------
+# Web server handlers (health + NEW API)
 # -----------------------------
 routes = web.RouteTableDef()
 
@@ -835,9 +936,85 @@ async def root_handler(request):
 async def health_check_handler(request):
     return web.Response(text="OK", content_type='text/plain')
 
+
+@routes.post('/api/create_token')
+async def create_token_handler(request: web.Request):
+    """
+    NEW API ENDPOINT
+    Called by PHP script to create tokens in MongoDB.
+    """
+    LOGGER.info("Received request on /api/create_token")
+
+    # 1. Check authorization
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return web.json_response({'error': 'Authorization header missing.'}, status=401)
+        
+        provided_secret = auth_header.split(' ', 1)[1]
+        if not hmac.compare_digest(provided_secret, Config.KC_LINK_SECRET):
+            LOGGER.warning("API call with invalid secret rejected.")
+            return web.json_response({'error': 'Invalid secret.'}, status=401)
+            
+    except Exception as e:
+        LOGGER.error(f"Auth check error: {e}")
+        return web.json_response({'error': 'Auth error.'}, status=401)
+
+    # 2. Get data from PHP
+    try:
+        data = await request.json()
+        qualities_list = data.get('qualities_list')
+        bot_username = data.get('bot_username')
+        
+        if not all([qualities_list, bot_username]):
+            return web.json_response({'error': 'Missing required data: qualities_list or bot_username'}, status=400)
+            
+    except Exception as e:
+        LOGGER.error(f"API JSON decode error: {e}")
+        return web.json_response({'error': 'Invalid JSON body.'}, status=400)
+
+    # 3. Process links (this logic is moved from PHP)
+    download_links = []
+    
+    for item in qualities_list:
+        try:
+            quality = str(item.get('quality', 'Unknown'))
+            message_id = int(item.get('id', 0))
+            size = int(item.get('size', 0))
+
+            if not message_id:
+                continue
+
+            # Create a basic signature (PHP equivalent) for storage
+            # Note: This payload is simple, just for consistency. The bot doesn't *use* it.
+            expiry_ts = int(time.time() + SETTINGS.get("token_expiry_seconds", Config.TOKEN_EXPIRY_SECONDS))
+            payload = f"{message_id}:{expiry_ts}:{bot_username}:api_v2"
+            signature = compute_expected_hmac(payload) # Use existing bot hmac function
+
+            # Create the short token in MongoDB
+            short_id = await create_short_token_for_msg(message_id, bot_username, signature)
+
+            if short_id:
+                link = f"https://t.me/{bot_username}?start={short_id}"
+                download_links.append({
+                    'quality': quality,
+                    'size': size,
+                    'link': link
+                })
+        except Exception as e:
+            LOGGER.error(f"Error processing quality {item}: {e}", exc_info=True)
+
+    # 4. Return the links array to PHP
+    if not download_links:
+        return web.json_response({'error': 'No links could be generated.'}, status=500)
+
+    LOGGER.info(f"Successfully generated {len(download_links)} links for bot {bot_username}.")
+    return web.json_response({'links': download_links}, status=200)
+
+
 async def start_web_server():
     app = web.Application()
-    app.add_routes(routes)
+    app.add_routes(routes) # This registers all @routes handlers
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
@@ -879,7 +1056,7 @@ async def inspect_token_cmd(client, message: Message):
 async def main_startup_logic():
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.6")
+    LOGGER.info("Starting File Sender Bot V4.6 (with API)")
     await load_settings_from_db()
     await create_db_indices()
     try:
@@ -897,7 +1074,7 @@ async def main_startup_logic():
     # Notify admin
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.6) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.6 + API) started.</b>", parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     LOGGER.info("Bot and web server running.")
