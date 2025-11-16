@@ -1,13 +1,15 @@
-# main.py (V4.6) - KeralaCaptain File Sender Bot (Short-token + API support)
+# main.py (V4.6 patched) - KeralaCaptain File Sender Bot (Patched + Admin UI + Robust indices + Reporting)
 """
-Full bot script - V4.6 (with /api/create_token endpoint)
-- Accepts short token IDs (stored in MongoDB temp_tokens) via /start
-- Looks up temp_tokens, validates expiry and bot, atomically deletes the token (single-use),
-  and sends the file to the user.
-- Preserves legacy long-token verification for backward compatibility.
-- Creates indices (TTL for temp_tokens.expiry), admin panel, broadcast, auto-delete, etc.
-- All user-facing messages use HTML parse mode.
-- INCLUDES: /api/create_token endpoint to allow PHP to request token creation.
+Patched full bot script.
+- Safe DB index creation (avoid IndexKeySpecsConflict)
+- CallbackQuery router and admin handlers (statistics, toggles)
+- Store post_id in temp_tokens when created via API
+- CSV export endpoint for admin usage
+- Notify user before file auto-deletion (1 hour before)
+- Help link and admin contact message included
+- Token revoke endpoint and token inspector improvements
+
+Note: adapt environment variables as required.
 """
 
 import os
@@ -43,7 +45,6 @@ from pyrogram.types import (
     InlineKeyboardButton
 )
 
-# pymongo helpers
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -132,22 +133,39 @@ bot = Client(
 start_time = time.time()
 
 # -----------------------------
-# Indices creation
+# Indices creation (safe)
 # -----------------------------
 async def create_db_indices():
     try:
-        # TTL index for sent_files_log delete_at (auto cleanup if desired)
-        await sent_files_log_col.create_index("delete_at", expireAfterSeconds=0)
-        # Unique / helpful indices
-        await issued_tokens_col.create_index("hash", unique=True)
-        await users_col.create_index("last_count_reset")
-        await media_collection.create_index("wp_post_id")
-        # TTL for temp tokens: temp_tokens.expiry (should be a MongoDB datetime)
-        # Note: expireAfterSeconds=0 will expire exactly at 'expiry'
-        await temp_tokens_col.create_index("expiry", expireAfterSeconds=0)
-        LOGGER.info("DB indices ensured.")
+        # sent_files_log TTL index
+        existing = [idx["name"] for idx in await sent_files_log_col.list_indexes().to_list(length=None)]
+        if "delete_at_1" not in existing:
+            await sent_files_log_col.create_index("delete_at", expireAfterSeconds=0, name="delete_at_1")
+
+        # issued_tokens_col unique hash index
+        existing = [idx["name"] for idx in await issued_tokens_col.list_indexes().to_list(length=None)]
+        if "hash_1" not in existing:
+            await issued_tokens_col.create_index("hash", unique=True, name="hash_1")
+
+        # users index
+        existing = [idx["name"] for idx in await users_col.list_indexes().to_list(length=None)]
+        if "last_count_reset_1" not in existing:
+            await users_col.create_index("last_count_reset", name="last_count_reset_1")
+
+        # media wp_post_id index: check if exists
+        existing_media_idx = await media_collection.list_indexes().to_list(length=None)
+        names = [idx["name"] for idx in existing_media_idx]
+        if "wp_post_id_1" not in names:
+            await media_collection.create_index("wp_post_id", name="wp_post_id_1")
+
+        # TTL for temp tokens
+        existing = [idx["name"] for idx in await temp_tokens_col.list_indexes().to_list(length=None)]
+        if "expiry_1" not in existing:
+            await temp_tokens_col.create_index("expiry", expireAfterSeconds=0, name="expiry_1")
+
+        LOGGER.info("DB indices ensured (safe mode).")
     except Exception as e:
-        LOGGER.error(f"Error creating indices: {e}", exc_info=True)
+        LOGGER.error(f"Error creating indices (safe): {e}", exc_info=True)
 
 # -----------------------------
 # Settings handling
@@ -194,7 +212,7 @@ async def update_db_setting(key: str, value):
         LOGGER.error(f"Failed to update setting {key}: {e}", exc_info=True)
 
 # -----------------------------
-# User helpers (same as V4.x)
+# User helpers
 # -----------------------------
 async def get_user_data(user_id: int):
     user_data = await users_col.find_one({"_id": user_id})
@@ -250,7 +268,9 @@ async def get_all_user_ids():
     cursor = users_col.find({"is_banned": False}, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
 
+# -----------------------------
 # Admin conversation helpers
+# -----------------------------
 async def set_admin_conv(chat_id, stage):
     await conversations_col.update_one({"_id": chat_id}, {"$set": {"stage": stage}}, upsert=True)
 
@@ -261,7 +281,7 @@ async def clear_admin_conv(chat_id):
     await conversations_col.delete_one({"_id": chat_id})
 
 # -----------------------------
-# Media helpers (same as before)
+# Media helpers
 # -----------------------------
 async def get_media_by_post_id(post_id: int):
     try:
@@ -291,7 +311,6 @@ async def get_post_id_from_msg_id(msg_id: int):
                         return document.get('wp_post_id')
                     if isinstance(v, dict) and v.get('id') == msg_id:
                         return document.get('wp_post_id')
-            # Handle new list format
             elif isinstance(message_ids_data, list):
                 for item in message_ids_data:
                     if isinstance(item, dict) and item.get('id') == msg_id:
@@ -302,7 +321,7 @@ async def get_post_id_from_msg_id(msg_id: int):
         return None
 
 # -----------------------------
-# Legacy long-token processing (keeps backward compatibility)
+# Legacy long-token processing
 # -----------------------------
 def _base64url_decode(s: str) -> bytes:
     padding = "=" * (-len(s) % 4)
@@ -322,9 +341,6 @@ def parse_token_raw(token_b64: str):
         return None, str(e)
 
 async def verify_token_basic(token_b64: str, expected_bot_username: str):
-    """
-    Legacy token verification (if token is long/base64). Returns (msg_id:int, token_raw:str) or (None, None)
-    """
     if not token_b64:
         return None, None
     token_raw, err = parse_token_raw(token_b64)
@@ -358,38 +374,29 @@ async def verify_token_basic(token_b64: str, expected_bot_username: str):
         return None, None
 
 # -----------------------------
-# NEW Short-token creation helpers (for Bot API)
+# Short-token creation helpers (for Bot API)
 # -----------------------------
-
 async def kc_generate_short_id(length=9):
-    """Generate a base62 short token string from random bytes."""
     alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
     max_val = len(alphabet) - 1
     try:
         b_bytes = os.urandom(length)
     except NotImplementedError:
-        # Fallback for systems without /dev/urandom
         b_bytes = str(time.time()).encode() + os.urandom(length)
-    
     result = ''
     for i in range(length):
         char_ord = b_bytes[i] if i < len(b_bytes) else (b_bytes[i % len(b_bytes)] + i) % 256
         result += alphabet[char_ord % (max_val + 1)]
     return result
 
-async def create_short_token_for_msg(message_id: int, bot_username: str, signature: str) -> (str | None):
-    """
-    Creates and inserts a single short token into temp_tokens_col.
-    Handles uniqueness collisions. Returns short_id or None on failure.
-    """
+async def create_short_token_for_msg(message_id: int, bot_username: str, signature: str, post_id: int | None = None) -> (str | None):
     expiry_seconds = SETTINGS.get("token_expiry_seconds", Config.TOKEN_EXPIRY_SECONDS)
     expiry_ts = int(time.time() + expiry_seconds)
     expiry_dt = datetime.fromtimestamp(expiry_ts, timezone.utc)
-    nonce = hashlib.sha256(os.urandom(16)).hexdigest()[:16] # 16 char nonce
+    nonce = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
 
     attempts = 0
     short_id = None
-    
     while attempts < 5:
         short_id = await kc_generate_short_id()
         doc = {
@@ -399,63 +406,46 @@ async def create_short_token_for_msg(message_id: int, bot_username: str, signatu
             'expiry_ts': expiry_ts,
             'bot': bot_username,
             'nonce': nonce,
-            'signature': signature, # Store the signature from PHP for consistency
+            'signature': signature,
             'created_at': datetime.now(timezone.utc),
+            'post_id': post_id
         }
         try:
             await temp_tokens_col.insert_one(doc)
-            # Success
             return short_id
         except DuplicateKeyError:
-            # Collision; try again
             attempts += 1
-            await asyncio.sleep(0.01) # Small delay
+            await asyncio.sleep(0.01)
         except Exception as e:
             LOGGER.error(f"API Token Insert Failed: {e}", exc_info=True)
             return None
-    
     LOGGER.error("Failed to generate unique short_id after 5 attempts.")
     return None
 
 # -----------------------------
-# Short-token lookup (new flow)
+# Short-token lookup and claim
 # -----------------------------
 async def resolve_short_token(short_id: str, expected_bot_username: str):
-    """
-    Look up temp_tokens collection for short_id.
-    - If found and not expired and bot matches: returns dict with message_id and the doc
-    - If not found or expired: returns None
-    IMPORTANT: This function does NOT delete the token. Deletion is done atomically at claim time.
-    """
     try:
         doc = await temp_tokens_col.find_one({"_id": short_id})
         if not doc:
             return None
-        # doc expiry stored as datetime in Mongo (expiry)
         expiry = doc.get("expiry")
         bot_for = doc.get("bot")
-        # If bot mismatch, refuse
         if bot_for and bot_for.lower() != expected_bot_username.lower():
             LOGGER.warning(f"Short token bot mismatch: {bot_for} != {expected_bot_username}")
             return None
-        # Check expiry timestamp if available
         expiry_ts = doc.get("expiry_ts")
         if expiry_ts:
             if time.time() > int(expiry_ts):
                 LOGGER.warning("Short token expired (by expiry_ts).")
                 return None
-        # also check expiry datetime object if present
-        # If reached here, consider token valid
         return doc
     except Exception as e:
         LOGGER.error(f"Error resolving short token {short_id}: {e}", exc_info=True)
         return None
 
 async def claim_and_delete_short_token(short_id: str, user_id: int):
-    """
-    Atomically find and delete token doc. Returns doc if deletion returned doc (claimed), else None.
-    This ensures single-use semantics: only the first claim succeeds.
-    """
     try:
         doc = await temp_tokens_col.find_one_and_delete({"_id": short_id})
         return doc
@@ -464,7 +454,7 @@ async def claim_and_delete_short_token(short_id: str, user_id: int):
         return None
 
 # -----------------------------
-# Refresh file reference function (same as before)
+# Refresh file reference function
 # -----------------------------
 async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
     LOGGER.warning(f"Attempting refresh for expired msg {expired_msg_id}")
@@ -495,7 +485,6 @@ async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
         old_qualities = media_doc.get('message_ids', {})
         found_and_updated = False
         new_qualities = None
-        
         if isinstance(old_qualities, list):
             new_qualities = []
             for item in old_qualities:
@@ -514,14 +503,13 @@ async def refresh_file_reference(bot_client: Client, expired_msg_id: int):
                     break
         else:
             new_qualities = old_qualities
-            
         if found_and_updated:
             await update_media_links_in_db(post_id, new_qualities, media_doc.get('stream_link', ''))
     except Exception as e:
         LOGGER.critical(f"Unhandled error during refresh: {e}", exc_info=True)
 
 # -----------------------------
-# UI helpers, admin keyboard (same as before)
+# UI helpers, admin keyboard
 # -----------------------------
 def get_main_admin_keyboard():
     return InlineKeyboardMarkup([
@@ -546,9 +534,7 @@ def get_settings_keyboard():
         [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin_main_menu")]
     ])
 
-# -----------------------------
-# Force-sub helper
-# -----------------------------
+# Force-sub button
 def get_force_sub_button(channel_ref):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔔 Join our official channel to receive downloads", url=channel_ref)]]
@@ -571,7 +557,7 @@ async def check_force_sub(user_id: int):
         return False
 
 # -----------------------------
-# Robust /start handler (handles short tokens and legacy long tokens)
+# Robust /start handler
 # -----------------------------
 _START_RE = re.compile(r'^/start(?:@[\w_]+)?(?:[ =])?(.+)?$', flags=re.IGNORECASE)
 
@@ -581,18 +567,14 @@ async def start_command_handler(client: Client, message: Message):
 
     # Admin /start goes to admin panel
     if user_id in Config.ADMIN_IDS:
-        # Check if it's /start admin (for panel) or /start token (for testing)
         text = (message.text or "").strip()
         m = _START_RE.match(text)
         token_group = m.group(1) if m else None
-        
         if not token_group:
             await admin_panel_handler(client, message)
             return
-        # If admin uses /start with a token, let it pass through to test the token
         LOGGER.info(f"Admin {user_id} is testing a start token...")
 
-    # Basic user checks
     user_data = await get_user_data(user_id)
     if user_data.get("is_banned", False):
         await message.reply_text("<b>❌ You are banned from using this bot.</b>", parse_mode=enums.ParseMode.HTML)
@@ -600,7 +582,6 @@ async def start_command_handler(client: Client, message: Message):
 
     LOGGER.info(f"[START] from={user_id} text={message.text!r} date={message.date}")
 
-    # Extract token string (tolerant)
     token = None
     text = (message.text or "").strip()
     m = _START_RE.match(text)
@@ -630,16 +611,15 @@ async def start_command_handler(client: Client, message: Message):
         await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(Config.WEBSITE_BUTTON_TEXT, url=Config.WEBSITE_URL)]]), parse_mode=enums.ParseMode.HTML)
         return
 
-    # Distinguish short-id tokens (alphanumeric base62 short ids) vs legacy tokens
-    is_short = bool(re.fullmatch(r'[A-Za-z0-9]{4,20}', token))  # short tokens (e.g., 6-12 chars)
+    is_short = bool(re.fullmatch(r'[A-Za-z0-9]{4,20}', token))
     bot_info = await bot.get_me()
     bot_username = bot_info.username or ""
 
     msg_id_to_send = None
     token_raw_for_claim = None
+    post_id_for_logging = None
 
     if is_short:
-        # Resolve short token from temp_tokens collection
         doc = await resolve_short_token(token, bot_username)
         if not doc:
             await message.reply_text(
@@ -648,11 +628,10 @@ async def start_command_handler(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
             return
-        # do not delete yet; we will atomically claim it AFTER we successfully send the file
         msg_id_to_send = int(doc.get("message_id"))
-        token_raw_for_claim = token  # the short id is used to claim
+        token_raw_for_claim = token
+        post_id_for_logging = doc.get('post_id')
     else:
-        # Try legacy long token verification
         msg_id_to_send, legacy_raw = await verify_token_basic(token, bot_username)
         if not msg_id_to_send:
             await message.reply_text(
@@ -661,12 +640,10 @@ async def start_command_handler(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
             return
-        # For legacy tokens we will claim using issued_tokens_col (hash) if single-use enabled
         token_raw_for_claim = legacy_raw
 
-    LOGGER.info(f"Resolved msg id to send: {msg_id_to_send}")
+    LOGGER.info(f"Resolved msg id to send: {msg_id_to_send} (post_id={post_id_for_logging})")
 
-    # Force-sub check
     if SETTINGS.get("force_sub_enabled"):
         is_joined = await check_force_sub(user_id)
         if not is_joined:
@@ -693,14 +670,12 @@ async def start_command_handler(client: Client, message: Message):
             )
             return
 
-    # Daily limit check (skip for admins)
     if user_id not in Config.ADMIN_IDS:
         daily_limit = SETTINGS.get("daily_limit", 5)
         if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
             await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
             return
 
-    # Send file and then atomically claim the token (so we don't pre-mark and cause race)
     status_msg = await message.reply_text("<b>✅ Link verified. Sending file, please wait...</b>", parse_mode=enums.ParseMode.HTML)
     try:
         sent_file_msg = await client.copy_message(
@@ -713,14 +688,11 @@ async def start_command_handler(client: Client, message: Message):
             await status_msg.edit_text("<b>❌ Error: Could not send file.</b>", parse_mode=enums.ParseMode.HTML)
             return
 
-        # Now claim token single-use semantics
         claimed = True
         if SETTINGS.get("single_use_tokens", True):
             if is_short:
-                # atomically find_one_and_delete short token
                 doc_claimed = await claim_and_delete_short_token(token_raw_for_claim, user_id)
                 if not doc_claimed:
-                    # someone else consumed it; remove the sent file we just delivered to avoid leakage
                     try:
                         await bot.delete_messages(chat_id=user_id, message_ids=sent_file_msg.id)
                     except Exception:
@@ -728,29 +700,23 @@ async def start_command_handler(client: Client, message: Message):
                     await status_msg.edit_text("<b>❌ This link has already been used by another user.</b>\n\nPlease get a fresh link from the website.", parse_mode=enums.ParseMode.HTML)
                     return
             else:
-                # legacy: use issued_tokens_col with token hash atomic claim
-                # compute hash and try to atomically set used flag
                 try:
                     raw_hash = token_hash_raw(token_raw_for_claim)
                     now = datetime.now(timezone.utc)
-                    # attempt to update unused doc first
                     filt = {"hash": raw_hash, "$or": [{"used": False}, {"used": {"$exists": False}}]}
                     update = {"$set": {"used": True, "used_by": user_id, "used_at": now}}
                     doc = await issued_tokens_col.find_one_and_update(filt, update, return_document=ReturnDocument.AFTER)
                     if doc:
                         claimed = True
                     else:
-                        # attempt to insert new document marking used (claim)
                         try:
                             await issued_tokens_col.insert_one({"hash": raw_hash, "issued_raw": token_raw_for_claim, "used": True, "used_by": user_id, "used_at": now, "issued_at": now})
                             claimed = True
                         except DuplicateKeyError:
-                            # someone else claimed
                             doc_existing = await issued_tokens_col.find_one({"hash": raw_hash})
                             if doc_existing and doc_existing.get("used"):
                                 claimed = False
                             else:
-                                # attempt final update
                                 updated = await issued_tokens_col.find_one_and_update({"hash": raw_hash, "used": False}, {"$set": {"used": True, "used_by": user_id, "used_at": now}}, return_document=ReturnDocument.AFTER)
                                 claimed = bool(updated and updated.get("used"))
                 except Exception as e:
@@ -765,12 +731,11 @@ async def start_command_handler(client: Client, message: Message):
                     await status_msg.edit_text("<b>❌ This link has already been used by another user.</b>\n\nPlease get a fresh link from the website.", parse_mode=enums.ParseMode.HTML)
                     return
 
-        # Log for auto deletion and increment daily count (don't count for admins)
         if user_id not in Config.ADMIN_IDS:
-            await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
+            await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send, post_id_for_logging)
             await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
         else:
-             await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send)
+             await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send, post_id_for_logging)
              LOGGER.info(f"Admin {user_id} downloaded a file. Daily count not incremented.")
              
         try:
@@ -780,8 +745,10 @@ async def start_command_handler(client: Client, message: Message):
 
         delete_hours = SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS)
         try:
+            help_button = InlineKeyboardMarkup([[InlineKeyboardButton("Contact Admin", url="https://t.me/KeralaCaptainHelpBot")]])
             await sent_file_msg.reply_text(
-                f"<b>⚠️ Download quickly</b>\n\nTo avoid copyright issues, this file will be removed in <b>{delete_hours} hours</b>.\nIf the link expires, get a fresh link from our website: {Config.WEBSITE_URL}",
+                f"<b>⚠️ Download quickly</b>\n\nTo avoid copyright issues, this file will be removed in <b>{delete_hours} hours</b>.\nIf the link expires, get a fresh link from our website: {Config.WEBSITE_URL}\nIf you face issues (iPhone forwarding or others), contact admin:",
+                reply_markup=help_button,
                 parse_mode=enums.ParseMode.HTML
             )
         except Exception:
@@ -820,9 +787,9 @@ async def start_command_handler(client: Client, message: Message):
             pass
 
 # -----------------------------
-# Log sent file & auto-delete
+# Log sent file & auto-delete (with pre-delete notification)
 # -----------------------------
-async def log_sent_file_for_deletion(user_id: int, message_obj: Message, original_message_id: int):
+async def log_sent_file_for_deletion(user_id: int, message_obj: Message, original_message_id: int, post_id: int | None = None):
     try:
         delete_at = datetime.now(timezone.utc) + timedelta(hours=SETTINGS.get("file_delete_hours", Config.FILE_DELETE_HOURS))
         file_name = None
@@ -840,13 +807,14 @@ async def log_sent_file_for_deletion(user_id: int, message_obj: Message, origina
             "log_channel_message_id": original_message_id,
             "file_name": file_name,
             "sent_at": datetime.now(timezone.utc),
-            "delete_at": delete_at
+            "delete_at": delete_at,
+            "post_id": post_id
         })
     except Exception as e:
         LOGGER.error(f"Failed to log sent file: {e}", exc_info=True)
 
 # -----------------------------
-# Background tasks
+# Background tasks (auto-delete + pre-delete notifications)
 # -----------------------------
 async def auto_delete_task():
     await asyncio.sleep(60)
@@ -854,6 +822,22 @@ async def auto_delete_task():
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
+            # Pre-delete notifications: notify users 1 hour before deletion if not yet notified
+            one_hour_from_now = now_utc + timedelta(hours=1)
+            cursor_notify = sent_files_log_col.find({"delete_at": {"$lte": one_hour_from_now, "$gt": now_utc}, "notified_before_delete": {"$ne": True}})
+            async for record in cursor_notify:
+                user_id = record.get("user_id")
+                file_name = record.get("file_name", "your file")
+                try:
+                    notify_text = (f"Reminder: the file <b>{file_name}</b> you downloaded will be removed in 1 hour. If you need a new copy, get a fresh link from: <b>{Config.WEBSITE_URL}</b>")
+                    await bot.send_message(user_id, notify_text, parse_mode=enums.ParseMode.HTML)
+                except Exception:
+                    pass
+                try:
+                    await sent_files_log_col.update_one({"_id": record["_id"]}, {"$set": {"notified_before_delete": True}})
+                except Exception:
+                    pass
+
             cursor = sent_files_log_col.find({"delete_at": {"$lte": now_utc}})
             async for record in cursor:
                 user_id = record.get("user_id")
@@ -867,8 +851,7 @@ async def auto_delete_task():
                     except Exception as e:
                         LOGGER.error(f"Error deleting message {tmsg_id} for {user_id}: {e}", exc_info=True)
                     try:
-                        notify_text = (f"Hello, your download link for the file <b>{file_name}</b> has expired. "
-                                       f"To get a new link, please visit our website: <b>{Config.WEBSITE_URL}</b>")
+                        notify_text = (f"Hello, your download link for the file <b>{file_name}</b> has expired. To get a new link, please visit our website: <b>{Config.WEBSITE_URL}</b>")
                         await bot.send_message(user_id, notify_text, parse_mode=enums.ParseMode.HTML)
                     except (UserIsBlocked, PeerIdInvalid):
                         LOGGER.info(f"Could not send expiry notification to {user_id} (blocked/invalid).")
@@ -901,19 +884,148 @@ async def daily_limit_reset_task():
             LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
 
 # -----------------------------
+# Admin callback router and stats handler
+# -----------------------------
+def _fmt(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+@bot.on_callback_query()
+async def admin_callback_router(client: Client, callback: CallbackQuery):
+    data = callback.data or ""
+    user_id = callback.from_user.id
+    if user_id not in Config.ADMIN_IDS:
+        try:
+            await callback.answer("Unauthorized", show_alert=True)
+        except Exception:
+            pass
+        return
+    if data == "admin_stats":
+        await handle_admin_stats(callback)
+    elif data == "admin_settings":
+        await callback.answer()
+        try:
+            await callback.message.edit_text("Settings panel", reply_markup=get_settings_keyboard(), parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+    elif data == "admin_broadcast":
+        await callback.answer("Broadcast panel not implemented yet", show_alert=True)
+    elif data == "admin_ban":
+        await callback.answer("Reply with /ban <user_id>", show_alert=True)
+    elif data == "admin_unban":
+        await callback.answer("Reply with /unban <user_id>", show_alert=True)
+    elif data.startswith("admin_toggle_"):
+        key = data.replace("admin_toggle_", "")
+        if key == "fsub":
+            new = not SETTINGS.get("force_sub_enabled", False)
+            await update_db_setting("force_sub_enabled", new)
+            await callback.answer(f"Force sub set to {new}")
+            await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard())
+        elif key == "protect":
+            new = not SETTINGS.get("protect_content_enabled", True)
+            await update_db_setting("protect_content_enabled", new)
+            await callback.answer(f"Protect content set to {new}")
+            await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard())
+        elif key == "single_use":
+            new = not SETTINGS.get("single_use_tokens", True)
+            await update_db_setting("single_use_tokens", new)
+            await callback.answer(f"Single-use tokens set to {new}")
+            await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard())
+        else:
+            await callback.answer("Unknown toggle", show_alert=True)
+    elif data == "admin_main_menu":
+        await callback.answer()
+        await callback.message.edit_text("Admin Panel", reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
+    else:
+        await callback.answer()
+
+async def handle_admin_stats(callback: CallbackQuery):
+    await callback.answer()
+    total_users = await get_total_users_count()
+    today_users = await get_today_users_count()
+    banned_count = await get_banned_users_count()
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    downloads_today = await sent_files_log_col.count_documents({"sent_at": {"$gte": today_start}})
+    downloads_total = await sent_files_log_col.count_documents({})
+    pipeline = [
+        {"$match": {"sent_at": {"$gte": today_start}}},
+        {"$group": {"_id": "$log_channel_message_id", "count": {"$sum": 1}, "file_name": {"$first": "$file_name"}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 1}
+    ]
+    top_today = await sent_files_log_col.aggregate(pipeline).to_list(length=1)
+    if top_today:
+        top_file_name = top_today[0].get("file_name", "unknown")
+        top_file_count = top_today[0].get("count", 0)
+    else:
+        top_file_name = "—"
+        top_file_count = 0
+    pipeline_user = [
+        {"$match": {"sent_at": {"$gte": today_start}}},
+        {"$group": {"_id": "$user_id", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 1}
+    ]
+    top_user = await sent_files_log_col.aggregate(pipeline_user).to_list(length=1)
+    if top_user:
+        top_user_id = top_user[0].get("_id")
+        top_user_count = top_user[0].get("count", 0)
+    else:
+        top_user_id = "—"
+        top_user_count = 0
+    text = (
+        f"<b>📊 Admin statistics</b>\n\n"
+        f"Total users: <b>{_fmt(total_users)}</b>\n"
+        f"New users today: <b>{_fmt(today_users)}</b>\n"
+        f"Total downloads (all time): <b>{_fmt(downloads_total)}</b>\n"
+        f"Downloads today: <b>{_fmt(downloads_today)}</b>\n\n"
+        f"Top file today: <b>{top_file_name}</b> — <b>{_fmt(top_file_count)}</b> downloads\n"
+        f"Top user today: <b>{top_user_id}</b> — <b>{_fmt(top_user_count)}</b> downloads\n\n"
+        f"Banned users: <b>{_fmt(banned_count)}</b>\n"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
+    except Exception:
+        await callback.message.reply_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
+
+# -----------------------------
 # Admin commands
 # -----------------------------
-# (Assuming admin_panel_handler, broadcast handlers etc. are in a separate file or you add them here)
-# Placeholder for admin panel
 @bot.on_message(filters.command("admin") & filters.user(Config.ADMIN_IDS) & filters.private)
 async def admin_panel_handler(client, message: Message):
-     await message.reply_text("Admin Panel (To be implemented)", reply_markup=get_main_admin_keyboard())
+     await message.reply_text("Admin Panel (Use buttons)", reply_markup=get_main_admin_keyboard())
 
-# (You would add your other admin handlers for stats, settings, broadcast, ban, unban here)
-# ...
-# ... (all other admin callback handlers go here)
-# ...
+@bot.on_message(filters.command("inspect_token") & filters.user(Config.ADMIN_IDS) & filters.private)
+async def inspect_token_cmd(client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /inspect_token <shortid_or_longtoken>", parse_mode=enums.ParseMode.HTML)
+        return
+    token = message.text.split(" ", 1)[1].strip()
+    if re.fullmatch(r'[A-Za-z0-9]{4,20}', token):
+        doc = await temp_tokens_col.find_one({"_id": token})
+        await message.reply_text(f"<pre>{doc}</pre>", parse_mode=enums.ParseMode.HTML)
+        return
+    raw, err = parse_token_raw(token)
+    if not raw:
+        await message.reply_text(f"Decode error: {err}", parse_mode=enums.ParseMode.HTML)
+        return
+    h = token_hash_raw(raw)
+    doc = await issued_tokens_col.find_one({"hash": h})
+    await message.reply_text(f"<pre>{raw}</pre>\n\nhash: {h}\nDB record: {doc}", parse_mode=enums.ParseMode.HTML)
 
+@bot.on_message(filters.command("revoke_short") & filters.user(Config.ADMIN_IDS) & filters.private)
+async def revoke_short_cmd(client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("Usage: /revoke_short <shortid>", parse_mode=enums.ParseMode.HTML)
+        return
+    short = message.text.split(" ", 1)[1].strip()
+    res = await temp_tokens_col.delete_one({"_id": short})
+    if res.deleted_count:
+        await message.reply_text("Short token revoked.", parse_mode=enums.ParseMode.HTML)
+    else:
+        await message.reply_text("Token not found.", parse_mode=enums.ParseMode.HTML)
 
 # -----------------------------
 # Web server handlers (health + NEW API)
@@ -936,64 +1048,82 @@ async def root_handler(request):
 async def health_check_handler(request):
     return web.Response(text="OK", content_type='text/plain')
 
+# CSV export for admin statistics (requires Authorization header with KC_LINK_SECRET)
+@routes.get('/admin/export_stats')
+async def export_stats_csv(request):
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return web.Response(status=401, text='Unauthorized')
+    if not hmac.compare_digest(auth.split(' ',1)[1], Config.KC_LINK_SECRET):
+        return web.Response(status=403, text='Forbidden')
+    # optional query params: date_from, date_to (YYYY-MM-DD)
+    params = request.rel_url.query
+    try:
+        date_from = params.get('date_from')
+        date_to = params.get('date_to')
+        if date_from:
+            dt_from = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+        else:
+            dt_from = datetime.now(timezone.utc) - timedelta(days=7)
+        if date_to:
+            dt_to = datetime.fromisoformat(date_to).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        else:
+            dt_to = datetime.now(timezone.utc) + timedelta(days=1)
+    except Exception:
+        return web.Response(status=400, text='Bad date format')
+    pipeline = [
+        {"$match": {"sent_at": {"$gte": dt_from, "$lt": dt_to}}},
+        {"$project": {"user_id": 1, "file_name": 1, "sent_at": 1, "telegram_message_id": 1, "post_id": 1}}
+    ]
+    rows = []
+    cursor = sent_files_log_col.aggregate(pipeline)
+    async for r in cursor:
+        rows.append(r)
+    # build CSV
+    import io, csv
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['user_id','file_name','sent_at','telegram_message_id','post_id'])
+    for r in rows:
+        writer.writerow([r.get('user_id'), r.get('file_name'), r.get('sent_at').isoformat(), r.get('telegram_message_id'), r.get('post_id')])
+    return web.Response(text=buf.getvalue(), content_type='text/csv')
 
 @routes.post('/api/create_token')
 async def create_token_handler(request: web.Request):
-    """
-    NEW API ENDPOINT
-    Called by PHP script to create tokens in MongoDB.
-    """
     LOGGER.info("Received request on /api/create_token")
-
-    # 1. Check authorization
     try:
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return web.json_response({'error': 'Authorization header missing.'}, status=401)
-        
         provided_secret = auth_header.split(' ', 1)[1]
         if not hmac.compare_digest(provided_secret, Config.KC_LINK_SECRET):
             LOGGER.warning("API call with invalid secret rejected.")
             return web.json_response({'error': 'Invalid secret.'}, status=401)
-            
     except Exception as e:
         LOGGER.error(f"Auth check error: {e}")
         return web.json_response({'error': 'Auth error.'}, status=401)
-
-    # 2. Get data from PHP
     try:
         data = await request.json()
         qualities_list = data.get('qualities_list')
         bot_username = data.get('bot_username')
-        
+        post_id = data.get('post_id')
         if not all([qualities_list, bot_username]):
             return web.json_response({'error': 'Missing required data: qualities_list or bot_username'}, status=400)
-            
     except Exception as e:
         LOGGER.error(f"API JSON decode error: {e}")
         return web.json_response({'error': 'Invalid JSON body.'}, status=400)
-
-    # 3. Process links (this logic is moved from PHP)
     download_links = []
-    
     for item in qualities_list:
         try:
             quality = str(item.get('quality', 'Unknown'))
             message_id = int(item.get('id', 0))
             size = int(item.get('size', 0))
-
             if not message_id:
                 continue
-
-            # Create a basic signature (PHP equivalent) for storage
-            # Note: This payload is simple, just for consistency. The bot doesn't *use* it.
             expiry_ts = int(time.time() + SETTINGS.get("token_expiry_seconds", Config.TOKEN_EXPIRY_SECONDS))
             payload = f"{message_id}:{expiry_ts}:{bot_username}:api_v2"
-            signature = compute_expected_hmac(payload) # Use existing bot hmac function
-
-            # Create the short token in MongoDB
-            short_id = await create_short_token_for_msg(message_id, bot_username, signature)
-
+            signature = compute_expected_hmac(payload)
+            short_id = await create_short_token_for_msg(message_id, bot_username, signature, post_id=post_id)
             if short_id:
                 link = f"https://t.me/{bot_username}?start={short_id}"
                 download_links.append({
@@ -1003,18 +1133,14 @@ async def create_token_handler(request: web.Request):
                 })
         except Exception as e:
             LOGGER.error(f"Error processing quality {item}: {e}", exc_info=True)
-
-    # 4. Return the links array to PHP
     if not download_links:
         return web.json_response({'error': 'No links could be generated.'}, status=500)
-
     LOGGER.info(f"Successfully generated {len(download_links)} links for bot {bot_username}.")
     return web.json_response({'links': download_links}, status=200)
 
-
 async def start_web_server():
     app = web.Application()
-    app.add_routes(routes) # This registers all @routes handlers
+    app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
@@ -1028,35 +1154,12 @@ async def start_web_server():
         sys.exit(1)
 
 # -----------------------------
-# Admin token inspector (optional)
-# -----------------------------
-@bot.on_message(filters.command("inspect_token") & filters.user(Config.ADMIN_IDS) & filters.private)
-async def inspect_token_cmd(client, message: Message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: /inspect_token <shortid_or_longtoken>", parse_mode=enums.ParseMode.HTML)
-        return
-    token = message.text.split(" ", 1)[1].strip()
-    # If short, check temp_tokens
-    if re.fullmatch(r'[A-Za-z0-9]{4,20}', token):
-        doc = await temp_tokens_col.find_one({"_id": token})
-        await message.reply_text(f"<pre>{doc}</pre>", parse_mode=enums.ParseMode.HTML)
-        return
-    # else attempt to decode long token
-    raw, err = parse_token_raw(token)
-    if not raw:
-        await message.reply_text(f"Decode error: {err}", parse_mode=enums.ParseMode.HTML)
-        return
-    h = token_hash_raw(raw)
-    doc = await issued_tokens_col.find_one({"hash": h})
-    await message.reply_text(f"<pre>{raw}</pre>\n\nhash: {h}\nDB record: {doc}", parse_mode=enums.ParseMode.HTML)
-
-# -----------------------------
 # Startup and lifecycle
 # -----------------------------
 async def main_startup_logic():
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.6 (with API)")
+    LOGGER.info("Starting File Sender Bot V4.6 (patched)")
     await load_settings_from_db()
     await create_db_indices()
     try:
@@ -1066,24 +1169,20 @@ async def main_startup_logic():
     except Exception as e:
         LOGGER.critical(f"Failed to start bot: {e}", exc_info=True)
         sys.exit(1)
-    # Background tasks
     asyncio.create_task(auto_delete_task())
     asyncio.create_task(daily_limit_reset_task())
-    # Web server
     await start_web_server()
-    # Notify admin
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.6 + API) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.6 patched) started.</b>", parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     LOGGER.info("Bot and web server running.")
     await asyncio.Event().wait()
 
-# Graceful shutdown handler
+# Graceful shutdown
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-
     async def shutdown_handler(sig):
         LOGGER.info(f"Received exit signal {sig.name}. Shutting down...")
         if bot and bot.is_connected:
@@ -1097,13 +1196,11 @@ if __name__ == "__main__":
             [task.cancel() for task in tasks]
             await asyncio.gather(*tasks, return_exceptions=True)
         loop.stop()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_handler(s)))
         except NotImplementedError:
             LOGGER.warning(f"Signal handling for {sig.name} not supported on this platform.")
-
     try:
         loop.run_until_complete(main_startup_logic())
         loop.run_forever()
