@@ -1,6 +1,7 @@
-# main.py (V4.8 patched) - KeralaCaptain File Sender Bot
+# main.py (V4.8.1 patched) - KeralaCaptain File Sender Bot
 """
 Patched full bot script.
+- Fix: TypeError on ~filters.command() by removing parentheses.
 - Feature: Whitelist Management Panel added to admin settings.
 - Whitelisted users bypass protect_content (can forward files).
 - Fix: Admin conversation handlers for settings (set limit, etc.)
@@ -129,7 +130,7 @@ SETTINGS = {}
 
 # Pyrogram bot client
 bot = Client(
-    name="KeralaCaptainSenderV4_8",
+    name="KeralaCaptainSenderV4_8_1",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
@@ -1101,7 +1102,8 @@ async def admin_panel_handler(client, message: Message):
       await message.reply_text("Admin Panel (Use buttons)", reply_markup=get_main_admin_keyboard())
 
 # This handler processes replies for admin buttons (Whitelist, Settings, etc.)
-@bot.on_message(filters.private & filters.user(Config.ADMIN_IDS) & ~filters.command() & filters.text)
+# --- THIS IS THE FIX (line 1104) ---
+@bot.on_message(filters.private & filters.user(Config.ADMIN_IDS) & ~filters.command & filters.text)
 async def admin_conversation_handler(client: Client, message: Message):
     admin_id = message.from_user.id
     conv = await get_admin_conv(admin_id)
@@ -1366,7 +1368,7 @@ async def create_token_handler(request: web.Request):
             signature = compute_expected_hmac(payload)
             short_id = await create_short_token_for_msg(message_id, bot_username, signature, post_id=post_id)
             if short_id:
-                link = f"https://t.me/{bot_username}?start={short_id}"
+                link = f"httpsT.me/{bot_username}?start={short_id}"
                 download_links.append({
                     'quality': quality,
                     'size': size,
@@ -1402,7 +1404,7 @@ async def start_web_server():
 async def main_startup_logic():
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.8 (patched)")
+    LOGGER.info("Starting File Sender Bot V4.8.1 (patched)")
     await load_settings_from_db()
     await create_db_indices()
     try:
@@ -1418,7 +1420,7 @@ async def main_startup_logic():
     await start_web_server()
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.8 patched) started.</b>\n\n- Auto-delete fix applied.\n- 10-hour rolling limit active.\n- Whitelist Management active.", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.8.1 patched) started.</b>\n\n- Typo fix applied.\n- Auto-delete fix applied.\n- 10-hour rolling limit active.\n- Whitelist Management active.", parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     LOGGER.info("Bot and web server running.")
