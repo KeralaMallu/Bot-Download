@@ -1,6 +1,11 @@
-# main.py (V4.6 patched) - KeralaCaptain File Sender Bot (Patched + Admin UI + Robust indices + Reporting)
+# main.py (V4.8 patched) - KeralaCaptain File Sender Bot
 """
 Patched full bot script.
+- Feature: Whitelist Management Panel added to admin settings.
+- Whitelisted users bypass protect_content (can forward files).
+- Fix: Admin conversation handlers for settings (set limit, etc.)
+- Fix: Auto-delete race condition (removed TTL, bot handles deletion).
+- Feature: Replaced daily limit with a 10-hour rolling window.
 - Safe DB index creation (avoid IndexKeySpecsConflict)
 - CallbackQuery router and admin handlers (statistics, toggles)
 - Store post_id in temp_tokens when created via API
@@ -124,7 +129,7 @@ SETTINGS = {}
 
 # Pyrogram bot client
 bot = Client(
-    name="KeralaCaptainSenderV4_6",
+    name="KeralaCaptainSenderV4_8",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
@@ -137,11 +142,6 @@ start_time = time.time()
 # -----------------------------
 async def create_db_indices():
     try:
-        # sent_files_log TTL index
-        existing = [idx["name"] for idx in await sent_files_log_col.list_indexes().to_list(length=None)]
-        if "delete_at_1" not in existing:
-            await sent_files_log_col.create_index("delete_at", expireAfterSeconds=0, name="delete_at_1")
-
         # issued_tokens_col unique hash index
         existing = [idx["name"] for idx in await issued_tokens_col.list_indexes().to_list(length=None)]
         if "hash_1" not in existing:
@@ -149,8 +149,11 @@ async def create_db_indices():
 
         # users index
         existing = [idx["name"] for idx in await users_col.list_indexes().to_list(length=None)]
-        if "last_count_reset_1" not in existing:
-            await users_col.create_index("last_count_reset", name="last_count_reset_1")
+        if "limit_window_start_1" not in existing:
+            await users_col.create_index("limit_window_start", name="limit_window_start_1")
+        if "is_whitelisted_1" not in existing:
+            await users_col.create_index("is_whitelisted", name="is_whitelisted_1")
+
 
         # media wp_post_id index: check if exists
         existing_media_idx = await media_collection.list_indexes().to_list(length=None)
@@ -221,22 +224,16 @@ async def get_user_data(user_id: int):
             "_id": user_id,
             "join_date": datetime.now(timezone.utc),
             "daily_file_count": 0,
-            "last_count_reset": datetime.now(timezone.utc).date().isoformat(),
-            "is_banned": False
+            "limit_window_start": None,
+            "is_banned": False,
+            "is_whitelisted": False  # New Whitelist Field
         }
         try:
             await users_col.insert_one(new_user)
             user_data = new_user
         except Exception:
             user_data = await users_col.find_one({"_id": user_id})
-    today = datetime.now(timezone.utc).date()
-    if user_data.get("last_count_reset") != today.isoformat():
-        user_data["daily_file_count"] = 0
-        user_data["last_count_reset"] = today.isoformat()
-        try:
-            await users_col.update_one({"_id": user_id}, {"$set": {"daily_file_count": 0, "last_count_reset": today.isoformat()}})
-        except Exception as e:
-            LOGGER.error(f"Failed to reset daily count for {user_id}: {e}", exc_info=True)
+    
     return user_data
 
 async def update_user_data(user_id: int, update_query: dict):
@@ -528,10 +525,21 @@ def get_settings_keyboard():
         [InlineKeyboardButton(f"Force Subscribe: {fsub_status}", callback_data="admin_toggle_fsub")],
         [InlineKeyboardButton(f"Protect Content: {protect_status}", callback_data="admin_toggle_protect")],
         [InlineKeyboardButton(f"Single-Use Tokens: {single_use_status}", callback_data="admin_toggle_single_use")],
-        [InlineKeyboardButton(f"Daily Limit: {SETTINGS.get('daily_limit', 5)}", callback_data="admin_set_limit")],
+        [InlineKeyboardButton("Manage Whitelist ➡️", callback_data="admin_whitelist_menu")],
+        [InlineKeyboardButton(f"Limit: {SETTINGS.get('daily_limit', 5)} files / 10h", callback_data="admin_set_limit")],
         [InlineKeyboardButton(f"Delete Time: {SETTINGS.get('file_delete_hours', Config.FILE_DELETE_HOURS)}h", callback_data="admin_set_delete_time")],
         [InlineKeyboardButton("Set Channel (username or -100..ID)", callback_data="admin_set_fsub_channel")],
         [InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin_main_menu")]
+    ])
+
+# New Whitelist Management Keyboard
+def get_whitelist_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add User", callback_data="admin_wl_add"),
+         InlineKeyboardButton("❌ Remove User", callback_data="admin_wl_remove")],
+        [InlineKeyboardButton("🔍 Check User", callback_data="admin_wl_check"),
+         InlineKeyboardButton("📊 Total Users", callback_data="admin_wl_total")],
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="admin_settings")]
     ])
 
 # Force-sub button
@@ -670,19 +678,50 @@ async def start_command_handler(client: Client, message: Message):
             )
             return
 
+    # --- New 10-Hour Rolling Limit Check ---
     if user_id not in Config.ADMIN_IDS:
         daily_limit = SETTINGS.get("daily_limit", 5)
-        if daily_limit > 0 and user_data.get("daily_file_count", 0) >= daily_limit:
-            await message.reply_text("<b>⚠️ Daily Limit Reached</b>\n\nYou have reached your daily download limit. Please try again tomorrow.", parse_mode=enums.ParseMode.HTML)
+        current_count = user_data.get("daily_file_count", 0)
+        window_start = user_data.get("limit_window_start")
+        now = datetime.now(timezone.utc)
+        
+        is_window_active = False
+        time_left_str = "10h 0m" # Default fallback
+        
+        if window_start and isinstance(window_start, datetime):
+            ten_hours_since_start = window_start + timedelta(hours=10)
+            if now < ten_hours_since_start:
+                is_window_active = True
+                time_left = ten_hours_since_start - now
+                hours_left = int(time_left.total_seconds() // 3600)
+                minutes_left = int((time_left.total_seconds() % 3600) // 60)
+                time_left_str = f"{hours_left}h {minutes_left}m"
+
+        if is_window_active and current_count >= daily_limit:
+            await message.reply_text(f"<b>⚠️ Limit Reached</b>\n\nYou have reached your limit of {daily_limit} files for this 10-hour window. Your limit will reset in <b>{time_left_str}</b>.", parse_mode=enums.ParseMode.HTML)
             return
+    # --- End of Limit Check ---
 
     status_msg = await message.reply_text("<b>✅ Link verified. Sending file, please wait...</b>", parse_mode=enums.ParseMode.HTML)
     try:
+        # --- NEW WHITELIST LOGIC ---
+        # Check the global setting
+        protect_default = SETTINGS.get("protect_content_enabled", True)
+        
+        # Check if the user is special (whitelisted)
+        user_is_whitelisted = user_data.get("is_whitelisted", False)
+
+        # Decide the final protection status
+        final_protect_status = protect_default
+        if user_is_whitelisted:
+            final_protect_status = False # Override! Allow forwarding for this user
+            LOGGER.info(f"User {user_id} is whitelisted. Bypassing content protection.")
+        
         sent_file_msg = await client.copy_message(
             chat_id=user_id,
             from_chat_id=Config.LOG_CHANNEL_ID,
             message_id=msg_id_to_send,
-            protect_content=SETTINGS.get("protect_content_enabled", True)
+            protect_content=final_protect_status # Use the final status
         )
         if not sent_file_msg:
             await status_msg.edit_text("<b>❌ Error: Could not send file.</b>", parse_mode=enums.ParseMode.HTML)
@@ -702,22 +741,22 @@ async def start_command_handler(client: Client, message: Message):
             else:
                 try:
                     raw_hash = token_hash_raw(token_raw_for_claim)
-                    now = datetime.now(timezone.utc)
+                    now_utc = datetime.now(timezone.utc)
                     filt = {"hash": raw_hash, "$or": [{"used": False}, {"used": {"$exists": False}}]}
-                    update = {"$set": {"used": True, "used_by": user_id, "used_at": now}}
+                    update = {"$set": {"used": True, "used_by": user_id, "used_at": now_utc}}
                     doc = await issued_tokens_col.find_one_and_update(filt, update, return_document=ReturnDocument.AFTER)
                     if doc:
                         claimed = True
                     else:
                         try:
-                            await issued_tokens_col.insert_one({"hash": raw_hash, "issued_raw": token_raw_for_claim, "used": True, "used_by": user_id, "used_at": now, "issued_at": now})
+                            await issued_tokens_col.insert_one({"hash": raw_hash, "issued_raw": token_raw_for_claim, "used": True, "used_by": user_id, "used_at": now_utc, "issued_at": now_utc})
                             claimed = True
                         except DuplicateKeyError:
                             doc_existing = await issued_tokens_col.find_one({"hash": raw_hash})
                             if doc_existing and doc_existing.get("used"):
                                 claimed = False
                             else:
-                                updated = await issued_tokens_col.find_one_and_update({"hash": raw_hash, "used": False}, {"$set": {"used": True, "used_by": user_id, "used_at": now}}, return_document=ReturnDocument.AFTER)
+                                updated = await issued_tokens_col.find_one_and_update({"hash": raw_hash, "used": False}, {"$set": {"used": True, "used_by": user_id, "used_at": now_utc}}, return_document=ReturnDocument.AFTER)
                                 claimed = bool(updated and updated.get("used"))
                 except Exception as e:
                     LOGGER.error(f"Error claiming legacy token: {e}", exc_info=True)
@@ -733,10 +772,27 @@ async def start_command_handler(client: Client, message: Message):
 
         if user_id not in Config.ADMIN_IDS:
             await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send, post_id_for_logging)
-            await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
+            
+            # --- New 10-Hour Limit Increment Logic ---
+            user_data_for_update = await get_user_data(user_id)
+            window_start_for_update = user_data_for_update.get("limit_window_start")
+            now_for_update = datetime.now(timezone.utc)
+
+            is_window_active_for_update = False
+            if window_start_for_update and isinstance(window_start_for_update, datetime):
+                ten_hours_since_start_update = window_start_for_update + timedelta(hours=10)
+                if now_for_update < ten_hours_since_start_update:
+                    is_window_active_for_update = True
+            
+            if is_window_active_for_update:
+                await update_user_data(user_id, {"$inc": {"daily_file_count": 1}})
+            else:
+                await update_user_data(user_id, {"$set": {"daily_file_count": 1, "limit_window_start": now_for_update}})
+            # --- End of Limit Increment Logic ---
+            
         else:
              await log_sent_file_for_deletion(user_id, sent_file_msg, msg_id_to_send, post_id_for_logging)
-             LOGGER.info(f"Admin {user_id} downloaded a file. Daily count not incremented.")
+             LOGGER.info(f"Admin {user_id} downloaded a file. Limit count not incremented.")
              
         try:
             await status_msg.delete()
@@ -838,6 +894,7 @@ async def auto_delete_task():
                 except Exception:
                     pass
 
+            # Find expired files
             cursor = sent_files_log_col.find({"delete_at": {"$lte": now_utc}})
             async for record in cursor:
                 user_id = record.get("user_id")
@@ -850,6 +907,7 @@ async def auto_delete_task():
                         pass
                     except Exception as e:
                         LOGGER.error(f"Error deleting message {tmsg_id} for {user_id}: {e}", exc_info=True)
+                    
                     try:
                         notify_text = (f"Hello, your download link for the file <b>{file_name}</b> has expired. To get a new link, please visit our website: <b>{Config.WEBSITE_URL}</b>")
                         await bot.send_message(user_id, notify_text, parse_mode=enums.ParseMode.HTML)
@@ -864,24 +922,8 @@ async def auto_delete_task():
                         LOGGER.error(f"Failed to delete sent_files_log record: {e}", exc_info=True)
         except Exception as e:
             LOGGER.critical(f"Error in auto_delete_task loop: {e}", exc_info=True)
-        await asyncio.sleep(600)
-
-async def daily_limit_reset_task():
-    while True:
-        now = datetime.now(timezone.utc)
-        tomorrow = now.date() + timedelta(days=1)
-        next_run = datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc) + timedelta(minutes=1)
-        wait_seconds = (next_run - now).total_seconds()
-        LOGGER.info(f"Daily reset will run in {timedelta(seconds=wait_seconds)}")
-        await asyncio.sleep(wait_seconds)
-        try:
-            result = await users_col.update_many(
-                {"daily_file_count": {"$gt": 0}},
-                {"$set": {"daily_file_count": 0, "last_count_reset": datetime.now(timezone.utc).date().isoformat()}}
-            )
-            LOGGER.info(f"Reset daily limits for {result.modified_count} users.")
-        except Exception as e:
-            LOGGER.critical(f"Error resetting daily limits: {e}", exc_info=True)
+        
+        await asyncio.sleep(60) 
 
 # -----------------------------
 # Admin callback router and stats handler
@@ -902,20 +944,32 @@ async def admin_callback_router(client: Client, callback: CallbackQuery):
         except Exception:
             pass
         return
+    
     if data == "admin_stats":
         await handle_admin_stats(callback)
+    
     elif data == "admin_settings":
         await callback.answer()
         try:
             await callback.message.edit_text("Settings panel", reply_markup=get_settings_keyboard(), parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
+    
     elif data == "admin_broadcast":
-        await callback.answer("Broadcast panel not implemented yet", show_alert=True)
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_broadcast")
+        await callback.message.edit_text("Please send the message to broadcast. (Forwarding not supported yet)")
+
     elif data == "admin_ban":
-        await callback.answer("Reply with /ban <user_id>", show_alert=True)
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_ban_id")
+        await callback.message.edit_text("Please send the User ID to **ban**.")
+    
     elif data == "admin_unban":
-        await callback.answer("Reply with /unban <user_id>", show_alert=True)
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_unban_id")
+        await callback.message.edit_text("Please send the User ID to **unban**.")
+
     elif data.startswith("admin_toggle_"):
         key = data.replace("admin_toggle_", "")
         if key == "fsub":
@@ -935,9 +989,60 @@ async def admin_callback_router(client: Client, callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=get_settings_keyboard())
         else:
             await callback.answer("Unknown toggle", show_alert=True)
+    
+    elif data == "admin_set_limit":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_limit")
+        await callback.message.edit_text("Please send the new file limit (e.g., 5).")
+
+    elif data == "admin_set_delete_time":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_delete_time")
+        await callback.message.edit_text("Please send the new delete time in hours (e.g., 12).")
+
+    elif data == "admin_set_fsub_channel":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_fsub_channel")
+        await callback.message.edit_text("Please send the channel ID (e.g., -100...) or username (@...).")
+
+    # --- New Whitelist Routes ---
+    elif data == "admin_whitelist_menu":
+        await callback.answer()
+        text = "<b>Manage Whitelist</b>\n\nUsers on this list will bypass `Protect Content` and be able to forward files."
+        await callback.message.edit_text(text, reply_markup=get_whitelist_keyboard(), parse_mode=enums.ParseMode.HTML)
+    
+    elif data == "admin_wl_add":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_wl_add_id")
+        await callback.message.edit_text("Please send the User ID to **add** to the whitelist.", parse_mode=enums.ParseMode.HTML)
+
+    elif data == "admin_wl_remove":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_wl_remove_id")
+        await callback.message.edit_text("Please send the User ID to **remove** from the whitelist.", parse_mode=enums.ParseMode.HTML)
+    
+    elif data == "admin_wl_check":
+        await callback.answer()
+        await set_admin_conv(user_id, "awaiting_wl_check_id")
+        await callback.message.edit_text("Please send the User ID to **check**.", parse_mode=enums.ParseMode.HTML)
+
+    elif data == "admin_wl_total":
+        await callback.answer("Checking count...")
+        try:
+            count = await users_col.count_documents({"is_whitelisted": True})
+            await callback.message.edit_text(
+                f"📊 There are currently <b>{count}</b> users on the whitelist.",
+                reply_markup=get_whitelist_keyboard(),
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as e:
+            await callback.message.edit_text(f"Error counting: {e}", reply_markup=get_whitelist_keyboard())
+    # --- End Whitelist Routes ---
+
     elif data == "admin_main_menu":
         await callback.answer()
         await callback.message.edit_text("Admin Panel", reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
+    
     else:
         await callback.answer()
 
@@ -946,9 +1051,12 @@ async def handle_admin_stats(callback: CallbackQuery):
     total_users = await get_total_users_count()
     today_users = await get_today_users_count()
     banned_count = await get_banned_users_count()
+    whitelist_count = await users_col.count_documents({"is_whitelisted": True})
+    
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     downloads_today = await sent_files_log_col.count_documents({"sent_at": {"$gte": today_start}})
     downloads_total = await sent_files_log_col.count_documents({})
+    
     pipeline = [
         {"$match": {"sent_at": {"$gte": today_start}}},
         {"$group": {"_id": "$log_channel_message_id", "count": {"$sum": 1}, "file_name": {"$first": "$file_name"}}},
@@ -956,12 +1064,9 @@ async def handle_admin_stats(callback: CallbackQuery):
         {"$limit": 1}
     ]
     top_today = await sent_files_log_col.aggregate(pipeline).to_list(length=1)
-    if top_today:
-        top_file_name = top_today[0].get("file_name", "unknown")
-        top_file_count = top_today[0].get("count", 0)
-    else:
-        top_file_name = "—"
-        top_file_count = 0
+    top_file_name = top_today[0].get("file_name", "—") if top_today else "—"
+    top_file_count = top_today[0].get("count", 0) if top_today else 0
+
     pipeline_user = [
         {"$match": {"sent_at": {"$gte": today_start}}},
         {"$group": {"_id": "$user_id", "count": {"$sum": 1}}},
@@ -969,12 +1074,9 @@ async def handle_admin_stats(callback: CallbackQuery):
         {"$limit": 1}
     ]
     top_user = await sent_files_log_col.aggregate(pipeline_user).to_list(length=1)
-    if top_user:
-        top_user_id = top_user[0].get("_id")
-        top_user_count = top_user[0].get("count", 0)
-    else:
-        top_user_id = "—"
-        top_user_count = 0
+    top_user_id = top_user[0].get("_id", "—") if top_user else "—"
+    top_user_count = top_user[0].get("count", 0) if top_user else 0
+    
     text = (
         f"<b>📊 Admin statistics</b>\n\n"
         f"Total users: <b>{_fmt(total_users)}</b>\n"
@@ -984,6 +1086,7 @@ async def handle_admin_stats(callback: CallbackQuery):
         f"Top file today: <b>{top_file_name}</b> — <b>{_fmt(top_file_count)}</b> downloads\n"
         f"Top user today: <b>{top_user_id}</b> — <b>{_fmt(top_user_count)}</b> downloads\n\n"
         f"Banned users: <b>{_fmt(banned_count)}</b>\n"
+        f"Whitelisted users: <b>{_fmt(whitelist_count)}</b>"
     )
     try:
         await callback.message.edit_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
@@ -991,11 +1094,147 @@ async def handle_admin_stats(callback: CallbackQuery):
         await callback.message.reply_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
 
 # -----------------------------
-# Admin commands
+# Admin commands & Conversation Handler
 # -----------------------------
 @bot.on_message(filters.command("admin") & filters.user(Config.ADMIN_IDS) & filters.private)
 async def admin_panel_handler(client, message: Message):
-     await message.reply_text("Admin Panel (Use buttons)", reply_markup=get_main_admin_keyboard())
+      await message.reply_text("Admin Panel (Use buttons)", reply_markup=get_main_admin_keyboard())
+
+# This handler processes replies for admin buttons (Whitelist, Settings, etc.)
+@bot.on_message(filters.private & filters.user(Config.ADMIN_IDS) & ~filters.command() & filters.text)
+async def admin_conversation_handler(client: Client, message: Message):
+    admin_id = message.from_user.id
+    conv = await get_admin_conv(admin_id)
+    if not conv:
+        return # Not in a conversation
+
+    stage = conv.get("stage")
+    text = message.text.strip()
+    
+    # --- Whitelist Handlers ---
+    if stage == "awaiting_wl_add_id":
+        try:
+            target_user_id = int(text)
+            await users_col.update_one({"_id": target_user_id}, {"$set": {"is_whitelisted": True}}, upsert=True)
+            await clear_admin_conv(admin_id)
+            await message.reply_text(f"✅ Success! User `{target_user_id}` is now on the whitelist.", reply_markup=get_whitelist_keyboard())
+            # Notify the user
+            await client.send_message(target_user_id, "🎉 Congratulations! You have been added to our whitelist. You can now forward files from this bot.")
+        except (UserIsBlocked, PeerIdInvalid):
+            await message.reply_text(f"✅ Success! User `{target_user_id}` was whitelisted, but I could not notify them (they may have blocked the bot).")
+        except ValueError:
+            await message.reply_text("Invalid User ID. Please send numbers only. Operation cancelled.")
+        except Exception as e:
+            await message.reply_text(f"Error: {e}")
+
+    elif stage == "awaiting_wl_remove_id":
+        try:
+            target_user_id = int(text)
+            await users_col.update_one({"_id": target_user_id}, {"$set": {"is_whitelisted": False}})
+            await clear_admin_conv(admin_id)
+            await message.reply_text(f"🗑️ Success! User `{target_user_id}` has been removed from the whitelist.", reply_markup=get_whitelist_keyboard())
+            # Notify the user
+            await client.send_message(target_user_id, "You have been removed from the whitelist. File forwarding is now disabled for you (based on global settings).")
+        except (UserIsBlocked, PeerIdInvalid):
+             await message.reply_text(f"🗑️ Success! User `{target_user_id}` was removed, but I could not notify them.")
+        except ValueError:
+            await message.reply_text("Invalid User ID. Please send numbers only. Operation cancelled.")
+        except Exception as e:
+            await message.reply_text(f"Error: {e}")
+
+    elif stage == "awaiting_wl_check_id":
+        try:
+            target_user_id = int(text)
+            user_data = await users_col.find_one({"_id": target_user_id})
+            await clear_admin_conv(admin_id)
+            if user_data and user_data.get("is_whitelisted"):
+                await message.reply_text(f"Yes, User `{target_user_id}` **is** on the whitelist.", reply_markup=get_whitelist_keyboard())
+            else:
+                await message.reply_text(f"No, User `{target_user_id}` is **not** on the whitelist.", reply_markup=get_whitelist_keyboard())
+        except ValueError:
+            await message.reply_text("Invalid User ID. Please send numbers only. Operation cancelled.")
+
+    # --- Other Setting Handlers ---
+    elif stage == "awaiting_limit":
+        try:
+            new_limit = int(text)
+            if new_limit < 0: raise ValueError
+            await update_db_setting("daily_limit", new_limit)
+            await clear_admin_conv(admin_id)
+            SETTINGS['daily_limit'] = new_limit # Update in-memory
+            await message.reply_text(f"✅ Limit set to {new_limit} files per 10 hours.", reply_markup=get_settings_keyboard())
+        except ValueError:
+            await message.reply_text("Invalid number. Operation cancelled.")
+
+    elif stage == "awaiting_delete_time":
+        try:
+            new_time = int(text)
+            if new_time <= 0: raise ValueError
+            await update_db_setting("file_delete_hours", new_time)
+            await clear_admin_conv(admin_id)
+            SETTINGS['file_delete_hours'] = new_time # Update in-memory
+            await message.reply_text(f"✅ File delete time set to {new_time} hours.", reply_markup=get_settings_keyboard())
+        except ValueError:
+            await message.reply_text("Invalid number. Must be a positive integer. Operation cancelled.")
+    
+    elif stage == "awaiting_fsub_channel":
+        try:
+            channel_id = 0
+            if text.startswith("@"):
+                channel_id = text
+            else:
+                channel_id = int(text)
+            
+            await client.get_chat(channel_id) # Test chat exists
+            
+            await update_db_setting("force_sub_channel_id", channel_id)
+            await clear_admin_conv(admin_id)
+            SETTINGS['force_sub_channel_id'] = channel_id # Update in-memory
+            await message.reply_text(f"✅ ForceSub channel set to `{channel_id}`.", reply_markup=get_settings_keyboard())
+        except ValueError:
+             await message.reply_text("Invalid ID. Must be an integer (like -100...) or a username (@...).")
+        except RPCError as e:
+            await message.reply_text(f"❌ Error setting channel: {e}\n\nMake sure the bot is an admin in that channel.")
+        except Exception as e:
+            await message.reply_text(f"❌ An unexpected error occurred: {e}")
+
+    elif stage == "awaiting_ban_id":
+        try:
+            target_user_id = int(text)
+            await users_col.update_one({"_id": target_user_id}, {"$set": {"is_banned": True}}, upsert=True)
+            await clear_admin_conv(admin_id)
+            await message.reply_text(f"🚫 User `{target_user_id}` has been banned.", reply_markup=get_main_admin_keyboard())
+        except ValueError:
+            await message.reply_text("Invalid User ID. Operation cancelled.")
+
+    elif stage == "awaiting_unban_id":
+        try:
+            target_user_id = int(text)
+            await users_col.update_one({"_id": target_user_id}, {"$set": {"is_banned": False}})
+            await clear_admin_conv(admin_id)
+            await message.reply_text(f"✅ User `{target_user_id}` has been unbanned.", reply_markup=get_main_admin_keyboard())
+        except ValueError:
+            await message.reply_text("Invalid User ID. Operation cancelled.")
+
+    elif stage == "awaiting_broadcast":
+        await clear_admin_conv(admin_id)
+        await message.reply_text("Broadcast started... (This may take a while)")
+        user_ids = await get_all_user_ids()
+        success_count = 0
+        fail_count = 0
+        for user_id in user_ids:
+            try:
+                await bot.send_message(user_id, text, parse_mode=enums.ParseMode.HTML)
+                success_count += 1
+                await asyncio.sleep(0.05) # 20 messages per second
+            except (UserIsBlocked, PeerIdInvalid):
+                fail_count += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.x + 1)
+            except Exception:
+                fail_count += 1
+        await message.reply_text(f"Broadcast complete.\n\nSent to: {success_count} users.\nFailed for: {fail_count} users.", reply_markup=get_main_admin_keyboard())
+
 
 @bot.on_message(filters.command("inspect_token") & filters.user(Config.ADMIN_IDS) & filters.private)
 async def inspect_token_cmd(client, message: Message):
@@ -1056,7 +1295,7 @@ async def export_stats_csv(request):
         return web.Response(status=401, text='Unauthorized')
     if not hmac.compare_digest(auth.split(' ',1)[1], Config.KC_LINK_SECRET):
         return web.Response(status=403, text='Forbidden')
-    # optional query params: date_from, date_to (YYYY-MM-DD)
+    
     params = request.rel_url.query
     try:
         date_from = params.get('date_from')
@@ -1071,6 +1310,7 @@ async def export_stats_csv(request):
             dt_to = datetime.now(timezone.utc) + timedelta(days=1)
     except Exception:
         return web.Response(status=400, text='Bad date format')
+    
     pipeline = [
         {"$match": {"sent_at": {"$gte": dt_from, "$lt": dt_to}}},
         {"$project": {"user_id": 1, "file_name": 1, "sent_at": 1, "telegram_message_id": 1, "post_id": 1}}
@@ -1079,7 +1319,7 @@ async def export_stats_csv(request):
     cursor = sent_files_log_col.aggregate(pipeline)
     async for r in cursor:
         rows.append(r)
-    # build CSV
+    
     import io, csv
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -1112,6 +1352,7 @@ async def create_token_handler(request: web.Request):
     except Exception as e:
         LOGGER.error(f"API JSON decode error: {e}")
         return web.json_response({'error': 'Invalid JSON body.'}, status=400)
+    
     download_links = []
     for item in qualities_list:
         try:
@@ -1133,8 +1374,10 @@ async def create_token_handler(request: web.Request):
                 })
         except Exception as e:
             LOGGER.error(f"Error processing quality {item}: {e}", exc_info=True)
+    
     if not download_links:
         return web.json_response({'error': 'No links could be generated.'}, status=500)
+    
     LOGGER.info(f"Successfully generated {len(download_links)} links for bot {bot_username}.")
     return web.json_response({'links': download_links}, status=200)
 
@@ -1159,7 +1402,7 @@ async def start_web_server():
 async def main_startup_logic():
     global start_time
     start_time = time.time()
-    LOGGER.info("Starting File Sender Bot V4.6 (patched)")
+    LOGGER.info("Starting File Sender Bot V4.8 (patched)")
     await load_settings_from_db()
     await create_db_indices()
     try:
@@ -1169,12 +1412,13 @@ async def main_startup_logic():
     except Exception as e:
         LOGGER.critical(f"Failed to start bot: {e}", exc_info=True)
         sys.exit(1)
+    
     asyncio.create_task(auto_delete_task())
-    asyncio.create_task(daily_limit_reset_task())
+    
     await start_web_server()
     if Config.ADMIN_IDS:
         try:
-            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.6 patched) started.</b>", parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(Config.ADMIN_IDS[0], f"<b>✅ File Sender Bot (V4.8 patched) started.</b>\n\n- Auto-delete fix applied.\n- 10-hour rolling limit active.\n- Whitelist Management active.", parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     LOGGER.info("Bot and web server running.")
