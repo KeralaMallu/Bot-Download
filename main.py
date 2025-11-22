@@ -1015,7 +1015,15 @@ async def handle_admin_stats(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
     except Exception:
         await callback.message.reply_text(text, reply_markup=get_main_admin_keyboard(), parse_mode=enums.ParseMode.HTML)
-
+        
+@bot.on_message(filters.command(["myid", "id"]) & filters.private)
+async def myid_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    await message.reply_text(
+        f"<b>Your Telegram ID:</b> <code>{uid}</code>",
+        parse_mode=enums.ParseMode.HTML
+    )
+    
 @bot.on_message(filters.command("admin") & filters.user(Config.ADMIN_IDS) & filters.private)
 async def admin_panel_handler(client, message: Message):
     await message.reply_text("Admin Panel (Use buttons)", reply_markup=get_main_admin_keyboard())
